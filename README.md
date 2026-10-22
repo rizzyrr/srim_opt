@@ -91,8 +91,9 @@ $env:GROQ_API_KEY = Read-Host "Groq key"
 To remove a saved Windows key: `[Environment]::SetEnvironmentVariable("GROQ_API_KEY", $null, "User")`.
 </details>
 
-**Choosing a model:** the default is `openai/gpt-oss-120b`. To use another Groq model, set `GROQ_MODEL`
-the same way. Larger models are more reliable at filling in a beam specification.
+**Choosing a model:** the default is `openai/gpt-oss-20b`, which is fast and cheap. To use another Groq model,
+set `GROQ_MODEL` the same way, for example `openai/gpt-oss-120b`. Larger models are more reliable at filling
+in a beam specification and at multi-step tool use.
 
 ## Install SRIM (optional: TRIM-confirmed results)
 
@@ -153,11 +154,22 @@ or something the model left out. Treat answers as a planning aid, and check the 
 
 ## How it works
 
+```mermaid
+flowchart LR
+    U(["Scientist<br/>plain English"]) --> UI["Ask (AI) tab<br/>or terminal<br/>srim_app.py / srim_agent.py"]
+    UI <--> A["Agent<br/>srim_agent.py"]
+    A <-->|"conversation +<br/>trimmed JSON results"| LLM[("Groq LLM<br/>gpt-oss")]
+    A -->|"tool calls"| T["Tools<br/>srim_tools.py"]
+    T --> O["Optimiser<br/>srim_optimiser.py"]
+    O --> S["Surrogate<br/>srim_surrogate.py<br/>about 1 s"]
+    O --> TR["TRIM via pysrim<br/>srim_core.py<br/>minutes"]
+    O --> SR["SR range tables<br/>instant"]
+    T -->|"JSON results"| A
+    A -->|"answer, checked numbers,<br/>charts, tool calls"| UI
 ```
-plain English ──► LLM (Groq) ──► tools (srim_tools.py) ──► optimiser (srim_optimiser.py)
-                     ▲                                        ├─ surrogate (srim_surrogate.py)   ~1 s
-                     └──── JSON results, numbers checked ─────┘─ TRIM via pysrim (srim_core.py)  minutes
-```
+
+The language model never computes anything. It reads the question, chooses tools and their arguments, and
+writes the answer from the tools' results. All physics runs locally in this repo's Python code.
 
 - **dpa scales linearly with fluence.** For a given energy, the fluence that gives the target dpa can be
   calculated exactly. Only the energy has to be searched, and that is the expensive part.
@@ -170,6 +182,124 @@ plain English ──► LLM (Groq) ──► tools (srim_tools.py) ──► opt
 
 [OPTIMISER_PROBLEM.md](OPTIMISER_PROBLEM.md) defines the problem in full, and
 [PART2_HANDOFF.md](PART2_HANDOFF.md) documents the Python API.
+
+### How a beam is chosen
+
+`screen()` and `plan()` in `srim_optimiser.py`:
+
+```mermaid
+flowchart TD
+    Q["Beam spec: target dpa, ROI rules,<br/>facility or energy range"] --> W["Energy window<br/>from the facility model"]
+    W --> F{"Feasible?<br/>SR ranges: can the ions<br/>reach past the ROI?"}
+    F -->|"no"| X["NOT FEASIBLE<br/>with the energy that would work"]
+    F -->|"yes"| P["Surrogate scans 60 energies<br/>and picks the best ROI"]
+    P --> D{"In the training domain<br/>and confident?"}
+    D -->|"yes"| PR["PREDICTED<br/>energy, fluence, ROI, 80 % band<br/>(screen stops here)"]
+    D -->|"no"| G["TRIM search:<br/>300-ion runs on a log grid"]
+    PR -->|"plan()"| C["One TRIM run of at least 1,000 ions<br/>at the proposed energy"]
+    G --> C
+    C --> V{"Valid ROI in the<br/>TRIM profile?"}
+    V -->|"yes"| OK["CONFIRMED by TRIM<br/>+ quality flags + provenance"]
+    V -->|"no"| L["Search around the proposal"] --> C
+```
+
+Fluence is never searched: for a chosen energy and ROI it is calculated exactly, because dpa is linear in
+fluence.
+
+## Inside the AI assistant
+
+The assistant (`srim_agent.py`) is a plain tool-calling loop on Groq's OpenAI-compatible API, with no agent
+framework. `srim_tools.py` wraps the optimiser as five JSON tools, so the language model can be swapped
+without touching the physics.
+
+| Tool | What it does | Time |
+|---|---|---|
+| `list_options` | Known materials, facilities and objectives | instant |
+| `energy_window` | Energies a facility can deliver for an ion (one facility, or all) | instant |
+| `screen_beam` | Predicted best energy, fluence and ROI from the surrogate | about 1 s |
+| `plan_beam` | The same, confirmed by a TRIM run. **Needs your approval** | 2–15 min |
+| `beam_time` | Irradiation time and dpa rate at a beam current | instant |
+
+### A typical conversation
+
+```mermaid
+sequenceDiagram
+    actor U as Scientist
+    participant A as Agent
+    participant L as Groq LLM
+    participant T as Tools
+    U->>A: "3 dpa in CuCrZr with Cu at the HZDR 3 MV, 50 nA on 1 cm²?"
+    A->>L: question + system rules + tool schemas
+    L-->>A: call screen_beam(...)
+    A->>T: screen_beam
+    T-->>A: PREDICTED energy, fluence, ROI, band
+    L-->>A: call beam_time(...)
+    A->>T: beam_time
+    T-->>A: hours, dpa rate
+    L-->>A: draft answer
+    A->>A: check every number against tool results
+    A-->>U: answer labelled "predicted" + depth profile and energy-scan charts
+    U->>A: "Confirm it with TRIM"
+    L-->>A: call plan_beam(...)
+    A-->>U: approval card: run TRIM now?
+    U->>A: Approve
+    A->>T: plan_beam (TRIM runs, progress shown)
+    T-->>A: CONFIRMED result + surrogate's own prediction
+    A-->>U: answer labelled "confirmed by TRIM", TRIM profile with the prediction dashed over it
+```
+
+### The agent's loop
+
+What `Agent.ask()` and `Agent.resume()` do with each question:
+
+```mermaid
+flowchart TD
+    Q(["User question"]) --> M["Send the conversation to the LLM"]
+    M --> R{"Tool calls<br/>in the reply?"}
+    R -->|"yes"| N{"plan_beam?<br/>(runs TRIM)"}
+    N -->|"yes"| H["Pause: approval card"]
+    H -->|"approved"| E["Run the tool locally"]
+    H -->|"declined"| DE["Tell the model: keep<br/>the prediction, don't ask again"]
+    N -->|"no"| E
+    E --> RES["Add the trimmed JSON result<br/>to the conversation"]
+    DE --> M
+    RES --> M
+    R -->|"no: final answer"| CK{"Every number found in a<br/>tool result or the user's text?"}
+    CK -->|"yes"| OUT(["Answer + charts + tool calls"])
+    CK -->|"no, first time"| RW["Send back: rewrite with<br/>tool numbers only"] --> M
+    CK -->|"no, after a rewrite"| WARN(["Answer with a warning<br/>listing the unverified numbers"])
+```
+
+At most 10 model calls are made per question, tool rounds included. Groq rate limits are retried twice.
+
+### Guardrails
+
+- **The number check.** `check_numbers()` extracts every number in the answer, including forms like
+  1.28e16, 1.28 × 10¹⁶ and 1,000. Each must match a number in a tool result, the user's messages or the
+  system prompt, to the precision quoted. Small integers such as list numbering are exempt, and a
+  percentage may quote a fraction (0.1 as 10 %). Tool results are rounded to 4 significant figures, so the
+  model can copy them exactly instead of re-rounding.
+- **Labels the model can't blur.** Every tool result carries a `status`, and the system prompt forbids
+  presenting a prediction as confirmed:
+
+  | Status | Source |
+  |---|---|
+  | `PREDICTED` | surrogate model, not verified |
+  | `CONFIRMED by TRIM simulation` | a real TRIM run |
+  | `NOT FEASIBLE` | SR range tables: the ions can't reach past the ROI in this energy window |
+  | `ENERGY WINDOW ONLY` | SR ranges; the surrogate declined (outside its domain or unsure) |
+
+- **It asks rather than guesses.** Without a target dpa, material, ion, and facility or energy range, the
+  tools return an error telling the model to ask the user.
+- **It names its defaults.** Results list `defaults_used` (ROI start and width, flatness, implant margin,
+  objective), and the model must tell the user which ones it assumed.
+- **A person approves every TRIM run.** `plan_beam` is held until you approve it in the app or at the
+  terminal prompt.
+- **Failures don't crash the chat.** Errors come back as `{"ok": false, "message": ...}`, so the model can
+  fix its arguments or pass the message on.
+- **What leaves your machine.** Groq receives the conversation and the trimmed tool results. Energy scans,
+  run lists and full profiles stay local: the app draws its charts from them. Your files and your SRIM folder
+  are never sent.
 
 ## Repository
 

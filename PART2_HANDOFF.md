@@ -17,7 +17,7 @@ return.
 
 The repo includes the trained model, the dataset (raw runs in `srim_outputs/dataset_cache/`, enough to
 retrain), the SR range tables and the figures, so nothing needs re-running. The same dataset and model are
-on Hugging Face as private repos under `bizzyrizzy`; ask Riz for access.
+on Hugging Face as private repos in the `srimopt` organization (`srimopt/srim-heavy-ion-damage-profiles`, `srimopt/heavysrim`); ask Riz to add you to it.
 
 ## Setup
 

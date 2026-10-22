@@ -1,6 +1,6 @@
 case,ok,energy_MeV,fluence,roi_nm,trim_runs,seconds,proposal,surrogate_fluence_error,roi_moved,message
-Cu -> CuCrZr,True,10.0,5419245044564356.0,874-1242,1,7,surrogate,-0.012983958349773617,True,"Cu at 10 MeV, 5.42e+15 ions/cm2: mean 3 dpa over 874-1242 nm (368 nm wide), 2.71-3.29 dpa across it."
-Fe -> Fe-9Cr,True,18.0,8.716863015959045e+16,208-832,1,180,surrogate,-0.01575979381778503,False,"Fe at 18 MeV, 8.72e+16 ions/cm2: mean 10 dpa over 208-832 nm (624 nm wide), 9.08-10.94 dpa across it; Fe5+ at 3 MV terminal."
-W -> W,True,35.0,398697464965581.06,1798-2344,1,117,surrogate,0.023122611768766177,False,"W at 35 MeV, 3.99e+14 ions/cm2: mean 1 dpa over 1798-2344 nm (545 nm wide), 0.92-1.05 dpa across it; W6+ at 5 MV terminal."
-Ni -> Ni,True,3.45,4825953416880246.0,853-1072,1,66,surrogate,0.029655351880390368,False,"Ni at 3.45 MeV, 4.83e+15 ions/cm2: mean 5 dpa over 853-1072 nm (220 nm wide), 4.58-5.30 dpa across it."
-Si -> SiC,True,30.0,1.8806256664600643e+17,442-1658,1,63,surrogate,0.09675745285072246,False,"Si at 30 MeV, 1.88e+17 ions/cm2: mean 1 dpa over 442-1658 nm (1215 nm wide), 0.93-1.06 dpa across it."
+Cu -> CuCrZr,True,10.0,7239556936495208.0,552-920,1,302,surrogate,0.029592977338126714,True,"Cu at 10 MeV, 7.24e+15 ions/cm2: mean 3 dpa over 552-920 nm (368 nm wide), 2.71-3.28 dpa across it."
+Fe -> Fe-9Cr,True,18.0,1.0661071709192254e+17,208-624,1,289,surrogate,0.10461649813962248,True,"Fe at 18 MeV, 1.07e+17 ions/cm2: mean 10 dpa over 208-624 nm (416 nm wide), 9.68-10.99 dpa across it; Fe5+ at 3 MV terminal."
+W -> W,True,35.0,469315783796832.3,1472-1853,1,392,surrogate,0.015985241115981097,True,"W at 35 MeV, 4.69e+14 ions/cm2: mean 1 dpa over 1472-1853 nm (382 nm wide), 0.90-1.09 dpa across it; W6+ at 5 MV terminal."
+Ni -> Ni,True,3.15,4998893609727303.0,765-969,1,207,surrogate,0.06448169426525929,False,"Ni at 3.15 MeV, 5e+15 ions/cm2: mean 5 dpa over 765-969 nm (204 nm wide), 4.67-5.39 dpa across it."
+Si -> SiC,True,30.0,1.924007783932168e+17,221-1658,1,210,surrogate,0.07250003777421443,False,"Si at 30 MeV, 1.92e+17 ions/cm2: mean 1 dpa over 221-1658 nm (1436 nm wide), 0.94-1.06 dpa across it."

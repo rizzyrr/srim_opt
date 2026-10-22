@@ -1,4 +1,5 @@
 import numpy as np
+import pytest
 
 import srim_core as core
 import srim_surrogate as sur
@@ -37,19 +38,93 @@ def test_reduced_energy_scales_with_energy():
     assert X.shape == (2, 4) and X[0, 1] == 0.0      # self-ion: log mass ratio is zero
 
 
-def _synthetic_set(n=40, seed=0):
+def _synthetic_set(n=40, seed=0, u_edges=sur.U_EDGES, n_ions=None):
     # Shapes whose peak position moves smoothly with the first input: something a GP should learn
     rng = np.random.default_rng(seed)
     X = np.column_stack([rng.uniform(-1, 1, n), rng.uniform(-0.5, 0.5, n), rng.choice([26, 29, 74], n),
-                         rng.choice([26, 29, 74], n)])
-    u = (sur.U_EDGES[:-1] + sur.U_EDGES[1:]) / 2
+                         rng.choice([26, 29, 74], n), rng.uniform(-1.5, -0.5, n), rng.uniform(-3, 0, n)])
+    u = (u_edges[:-1] + u_edges[1:]) / 2
+    du = np.diff(u_edges)
     peaks = 0.8 + 0.1 * X[:, 0]
     S = np.exp(-0.5 * ((u[None] - peaks[:, None]) / 0.2) ** 2)
-    S /= S.sum(1, keepdims=True) * sur.DU
+    S /= (S * du).sum(1, keepdims=True)
     G = np.exp(-0.5 * ((u[None] - 1.0) / 0.25) ** 2)
-    G = np.repeat(G / (G.sum() * sur.DU), n, axis=0)
+    G = np.repeat(G / (G * du).sum(), n, axis=0)
     return sur.TrainingSet(targets=np.array(['Cu'] * n), ions=np.array(['Cu'] * n), energy_eV=np.full(n, 5e6),
-                           X=X, log_eta=-1.0 + 0.2 * X[:, 0], stopped=np.ones(n), S=S, G=G, order=np.arange(n))
+                           X=X, log_eta=-1.0 + 0.2 * X[:, 0], stopped=np.ones(n), S=S, G=G, order=np.arange(n),
+                           n_ions=n_ions, u_edges=u_edges)
+
+
+def _cu_table():
+    # Ranges as in the test below; stopping powers non-zero, so the SR inputs are defined
+    E = np.geomspace(1e4, 6e7, 60)
+    return core.RangeTable('Cu', E, 0.05 * (E / 1e3) ** 0.5, np.full_like(E, 50.0), 1e-3 * E ** 0.8, 3e-4 * E ** 0.8)
+
+
+def test_light_ions_get_the_light_model(tmp_path, monkeypatch):
+    assert [sur.ion_family(i) for i in ('H', 'He', 'C', 'Au')] == ['light', 'light', 'heavy', 'heavy']
+    paths = {'heavy': str(tmp_path / 'heavy.npz'), 'light': str(tmp_path / 'light.npz')}
+    monkeypatch.setattr(sur, 'MODEL_PATHS', paths)
+    sur.Surrogate.fit(_synthetic_set(), eta_baseline=None).save(paths['heavy'])
+    assert sur.load_latest('He') is None                    # no light model yet: the optimiser searches with TRIM
+    sur.Surrogate.fit(_synthetic_set(u_edges=sur.LIGHT_U_EDGES), eta_baseline=None, family='light').save(paths['light'])
+    assert sur.load_latest('H').info['family'] == 'light' and sur.load_latest('He') is sur.load_latest('H')
+    assert sur.load_latest('Cu').info['family'] == 'heavy' and sur.load_latest() is sur.load_latest('W')
+    assert sur.load_latest(paths['light']).info['family'] == 'light'   # the old signature, load_latest(path)
+
+
+def test_per_model_grid_round_trip(tmp_path):
+    ts = _synthetic_set(u_edges=sur.LIGHT_U_EDGES)
+    model = sur.Surrogate.fit(ts, eta_baseline=None, features='sr', family='light')
+    path = str(tmp_path / 'light.npz')
+    model.save(path)
+    loaded = sur.Surrogate.load(path)
+    assert np.array_equal(loaded.u_edges, sur.LIGHT_U_EDGES) and loaded.feature_kind == 'sr'
+    p = loaded.predict_profiles(core.MATERIALS['Cu'], 'Cu', [5e6], table=_cu_table())[0]
+    Rp = p.meta['Rp_nm']
+    assert np.allclose(p.depth_nm, sur.out_edges(sur.LIGHT_U_EDGES)[1:] * Rp)
+    assert p.depth_nm[-1] == pytest.approx(2.0 * Rp) and len(p.depth_nm) == 2 * (len(sur.LIGHT_U_EDGES) - 1)
+    assert abs(np.sum(p.implanted) * p.bin_nm * 1e-7 - 1.0) < 0.05     # ~all ions stop, on the finer grid too
+    # A model saved before v2 (no grid, no feature set in its file) keeps v1's grid and inputs
+    v1 = sur.Surrogate.fit(_synthetic_set(), eta_baseline=None)
+    arrays = {k: v for k, v in v1.a.items() if k != 'u_edges'}
+    info = {k: v for k, v in v1.info.items() if k != 'features'}
+    old = sur.Surrogate(arrays, info)
+    assert np.array_equal(old.u_edges, sur.U_EDGES) and old.feature_kind == 'v1'
+
+
+def test_sqrt_shapes_round_trip(tmp_path):
+    ts = _synthetic_set()
+    model = sur.Surrogate.fit(ts, eta_baseline=None, shape_transform='sqrt')
+    path = str(tmp_path / 'sqrt.npz')
+    model.save(path)
+    loaded = sur.Surrogate.load(path)
+    m, _ = loaded.predict_outputs(ts.X[:3])
+    s = loaded._shape('damage', m['damage'][0])
+    assert abs(np.sum(s * np.diff(loaded.u_edges)) - 1) < 1e-9          # squared and brought back to area 1
+    assert 0.5 * np.sum(np.abs(s - ts.S[0])) * sur.DU < 0.05            # and close to the training shape
+    p = loaded.predict_profiles(core.MATERIALS['Cu'], 'Cu', [5e6], table=_cu_table())[0]
+    assert np.all(p.Tdam_density >= 0) and abs(np.sum(p.implanted) * p.bin_nm * 1e-7 - 1.0) < 0.05
+
+
+def test_ion_count_weighting_trusts_runs_with_more_ions(tmp_path):
+    # Half the runs have 30x the ions; their outputs carry a deliberate offset that the low-count runs do not. A
+    # weighted model follows the high-count runs more closely than an unweighted one.
+    n = 60
+    n_ions = np.where(np.arange(n) % 2 == 0, 9000, 300)
+    ts = _synthetic_set(n=n, n_ions=n_ions)
+    rng = np.random.default_rng(3)
+    ts.log_eta = ts.log_eta + np.where(n_ions > 300, 0.0, rng.normal(0, 0.05, n))
+    plain = sur.Surrogate.fit(ts, eta_baseline=None)
+    weighted = sur.Surrogate.fit(ts, eta_baseline=None, ion_weighting=True)
+    assert weighted.info['n_ref'] == np.median(n_ions)      # every run is in the hyperparameter subset here
+    hi = n_ions > 300
+    err = lambda m: np.abs(m.predict_outputs(ts.X[hi])[0]['totals'][:, 0] - ts.log_eta[hi]).mean()  # noqa: E731
+    assert err(weighted) < err(plain)
+    path = str(tmp_path / 'w.npz')
+    weighted.save(path)
+    again = sur.Surrogate.load(path)
+    assert np.allclose(again.predict_outputs(ts.X[:5])[0]['totals'], weighted.predict_outputs(ts.X[:5])[0]['totals'])
 
 
 def test_sr_nuclear_fraction():

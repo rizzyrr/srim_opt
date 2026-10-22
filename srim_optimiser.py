@@ -17,7 +17,7 @@
 
 import math
 import time
-from dataclasses import asdict, dataclass, field
+from dataclasses import asdict, dataclass, field, replace
 from typing import Callable, Dict, List, Optional, Tuple, Union
 
 import numpy as np
@@ -137,7 +137,7 @@ class BeamSpec:
     width_slack: float = 0.05               # 'width': within one profile, ROIs within 5 % of the widest tie
                                             # and the lowest fluence wins
     max_fluence: Optional[float] = None     # optional beam-time cap, ions/cm2
-    ions_search: int = 300
+    ions_search: int = 300                  # H and He runs use at least LIGHT_MIN_IONS (their damage is sparse)
     ions_confirm: int = 1000
     time_budget_s: float = 900.0            # soft limit for the whole plan, confirmation included (a TRIM
                                             # search needs ~5-8 runs; with the surrogate it is one run)
@@ -170,6 +170,23 @@ class BeamSpec:
     @classmethod
     def from_dict(cls, d: dict) -> 'BeamSpec':
         return cls(**{k: v for k, v in d.items() if k in cls.__dataclass_fields__})
+
+
+# Fewest ions for a search and a confirmation run of a light ion. Rare high-energy recoils carry most of an H or He
+# ion's damage energy, so a 10,000-ion run still leaves 3-8 % noise in the mean dpa over an ROI (measured on the test
+# runs, and 8 % for a 9 MeV He plan into W); 30,000 ions bring it to about 3 % for H and 5 % for He at a few MeV, and
+# plan() flags what is left. Each H ion costs TRIM about a sixth of a heavy ion's time and each He ion a third
+# (LIGHT_COST), so a 30,000-ion confirmation takes about 2-7 minutes.
+LIGHT_MIN_IONS = {'H': (5000, 30000), 'He': (5000, 30000)}
+NOISE_FLAG = 0.02   # flag a confirmation whose mean dpa over the ROI is this uncertain (1 sigma) from TRIM's noise
+LIGHT_COST = {'H': 0.16, 'He': 0.3}   # TRIM time per ion relative to a heavy ion's (srim_dataset.py throughput --light)
+
+
+def _with_ion_floors(spec: 'BeamSpec', ion: str) -> 'BeamSpec':
+    if ion not in LIGHT_MIN_IONS:
+        return spec
+    search, confirm = LIGHT_MIN_IONS[ion]
+    return replace(spec, ions_search=max(spec.ions_search, search), ions_confirm=max(spec.ions_confirm, confirm))
 
 
 def _jsonable(x):
@@ -352,9 +369,9 @@ class _Runs:
         return time.time() - self.started
 
     def estimate_s(self, E_MeV: float, n: int) -> float:
-        # Measured on this machine: ~0.15 s per ion at 5 MeV, slower at higher energy. Rescaled by
-        # how fast this plan's own runs have been.
-        prior = 3.0 + n * 0.15 * (E_MeV / 5.0) ** 0.5
+        # Measured on this machine: ~0.15 s per ion at 5 MeV, slower at higher energy (H and He: LIGHT_COST of
+        # that). Rescaled by how fast this plan's own runs have been.
+        prior = 3.0 + n * 0.15 * LIGHT_COST.get(self.ion, 1.0) * (E_MeV / 5.0) ** 0.5
         return prior * (float(np.median(self._ratios)) if self._ratios else 1.0)
 
     def run(self, E_MeV: float, n: int, stage: str) -> Tuple[core.DamageProfile, Optional[dict]]:
@@ -438,7 +455,7 @@ def _flags(p: core.DamageProfile, r: dict, E: float, e_lo: float, e_hi: float,
         flags.append(f'Coarse depth bins: {p.bin_nm:.0f} nm bins across a {r["roi_width_nm"]:.0f} nm ROI.')
     if p.damaged_bins < 20:
         flags.append(f'Only {p.damaged_bins} depth bins contain damage; the profile is coarse.')
-    if p.Tdam_balance_eV > 0 and abs(p.Tdam_eV - p.Tdam_balance_eV) / p.Tdam_balance_eV > 0.05:
+    if core.energy_balance_off(p):
         flags.append('Damage energy from PHONON.txt and the energy balance differ by more than 5 %.')
     if E >= e_hi * 0.97:
         flags.append(f'The optimum is at the highest energy allowed ({e_hi:g} MeV): the accelerator limit binds.')
@@ -446,6 +463,10 @@ def _flags(p: core.DamageProfile, r: dict, E: float, e_lo: float, e_hi: float,
         flags.append(f'The optimum is at the lowest energy allowed ({e_lo:g} MeV).')
     if p.meta.get('too_thin'):
         flags.append('Ions reached the back of the target even after making it thicker.')
+    noise = core.mean_dpa_noise(p, r['roi_start_nm'], r['roi_end_nm'])
+    if noise > NOISE_FLAG:
+        flags.append(f'TRIM noise: the mean dpa over the ROI from this {p.number_ions:,}-ion run is uncertain by about '
+                     f'{noise:.0%} (1 sigma); more ions (ions_confirm) would narrow it.')
     if search_r is not None:
         a, b = objective_value(search_r, objective), objective_value(r, objective)
         if a and b and abs(a - b) / max(abs(b), 1e-30) > 0.15:
@@ -465,6 +486,7 @@ def plan(material: Union[str, core.Material], ion: str, spec: BeamSpec,
     `minimised=True` runs TRIM in a minimised, low-priority window (for background use).
     """
     m, name = _resolve_material(material)
+    spec = _with_ion_floors(spec, ion)
     result = PlanResult(ok=False, message='', material=name, ion=ion, spec=asdict(spec))
     problems = spec.validate() + m.validate()
     if problems:
@@ -473,7 +495,7 @@ def plan(material: Union[str, core.Material], ion: str, spec: BeamSpec,
 
     e_lo, e_hi, notes = spec.energy_limits(ion)
     result.energy_window_MeV = (e_lo, e_hi)
-    result.flags += notes
+    result.flags += notes + [n for n in [core.assumed_Ed_note(m)] if n]
     table = core.sr_table(m, ion, srim_dir=srim_dir)
     e_feas = feasible_from_MeV(table, spec, e_lo, e_hi)
     if e_feas is None:
@@ -535,7 +557,7 @@ def plan(material: Union[str, core.Material], ion: str, spec: BeamSpec,
         # The confirmation can choose a different ROI when two windows are nearly equally good, and then the
         # predicted and confirmed fluences belong to different windows.
         pred = result.prediction
-        q = _load_surrogate(surrogate).predict_profiles(m, ion, [E_best * 1e6], table=table)[0]
+        q = _load_surrogate(surrogate, ion).predict_profiles(m, ion, [E_best * 1e6], table=table)[0]
         x = np.linspace(r['roi_start_nm'], r['roi_end_nm'], 50)
         f_same = spec.target_dpa / float(np.interp(x, q.depth_nm, q.dpa(1.0)).mean())
         overlap = min(r['roi_end_nm'], pred['roi_end_nm']) - max(r['roi_start_nm'], pred['roi_start_nm'])
@@ -565,15 +587,16 @@ def plan(material: Union[str, core.Material], ion: str, spec: BeamSpec,
 MAX_UNCERTAINTY = 0.5   # surrogate spread (relative to the training spread) above which TRIM searches instead
 
 
-def _load_surrogate(surrogate):
-    # surrogate=None: the saved model if there is one; False: never; otherwise the model passed in
+def _load_surrogate(surrogate, ion: str):
+    # surrogate=None: the saved model of the ion's family (heavy, or H and He) if there is one; False: never;
+    # otherwise the model passed in
     if surrogate is False:
         return None
     if surrogate is not None:
         return surrogate
     try:
         import srim_surrogate
-        return srim_surrogate.load_latest()
+        return srim_surrogate.load_latest(ion)
     except Exception:   # no scikit-learn, or an unreadable model file: search with TRIM instead
         return None
 
@@ -581,7 +604,7 @@ def _load_surrogate(surrogate):
 def _surrogate_proposal(surrogate, material, name, ion, spec, e_lo, e_hi, n_energies: int = 60,
                         n_samples: int = 30) -> Optional[dict]:
     # Best energy from the surrogate's predicted profiles, or None if no model is trained or it is unsure
-    model = _load_surrogate(surrogate)
+    model = _load_surrogate(surrogate, ion)
     if model is None:
         return None
     table = core.sr_table(material, ion)
@@ -606,9 +629,11 @@ def _surrogate_proposal(surrogate, material, name, ion, spec, e_lo, e_hi, n_ener
     band = {'fluence': [float(v) for v in np.percentile(fluences, [10, 90])],
             'feasible_fraction': len(ok) / len(redone)}
     q = model.info.get('fluence_log_q80')
+    if [name, ion] in model.info.get('pairs', []) and model.info.get('fluence_log_q80_seen_pairs'):
+        q = model.info['fluence_log_q80_seen_pairs']   # a pair the model was trained on, at another energy
     if q:
-        # The model's own spread is too narrow: widen it to what held-out ion-target pairs showed (80 % of
-        # them were inside this factor of the prediction)
+        # The model's own spread is too narrow: widen it to what held-out test runs showed (80 % of them were
+        # inside this factor of the prediction)
         f = r_best['fluence']
         band['fluence'] = [min(band['fluence'][0], f * math.exp(-q)), max(band['fluence'][1], f * math.exp(q))]
         band['calibrated_on_heldout_pairs'] = True
@@ -631,7 +656,7 @@ def screen(material: Union[str, core.Material], ion: str, spec: BeamSpec,
         result.message = ' '.join(problems)
         return result
     e_lo, e_hi, notes = spec.energy_limits(ion)
-    result.energy_window_MeV, result.flags = (e_lo, e_hi), notes
+    result.energy_window_MeV, result.flags = (e_lo, e_hi), notes + [n for n in [core.assumed_Ed_note(m)] if n]
     table = core.sr_table(m, ion, srim_dir=srim_dir)
     e_feas = feasible_from_MeV(table, spec, e_lo, e_hi)
     if e_feas is None:
@@ -653,6 +678,6 @@ def screen(material: Union[str, core.Material], ion: str, spec: BeamSpec,
         result.best['beam_setting'] = beam_setting(spec.facility, proposal['energy_MeV'], ion, spec.q_max)
     fl = band.get('fluence')
     result.message = (f'Predicted (not yet verified): {ion} at {proposal["energy_MeV"]:g} MeV, {r["fluence"]:.3g} '
-                      f'ions/cm2' + (f' (80 % band {fl[0]:.2g}-{fl[1]:.2g})' if fl else '')
+                      f'ions/cm2' + (f' (80 % band {fl[0]:.3g}-{fl[1]:.3g})' if fl else '')
                       + f', ROI {r["roi_start_nm"]:.0f}-{r["roi_end_nm"]:.0f} nm. Run plan() to confirm with TRIM.')
     return result

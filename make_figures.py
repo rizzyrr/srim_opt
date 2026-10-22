@@ -62,6 +62,8 @@ def learning_curve() -> None:
     ax.plot(df.training_runs, 100 * df.shape_error_median, color=COLORS[1], marker='s', lw=2, ms=5,
             label='damage profile shape, median')
     ax.set_xscale('log')
+    ax.minorticks_off()
+    ax.set_xticks(df.training_runs)
     ax.xaxis.set_major_formatter(ScalarFormatter())
     ax.set_ylim(bottom=0)
     ax.set_xlabel('TRIM runs in the training set')
@@ -94,7 +96,7 @@ def parity() -> None:
     ax.set_aspect('equal')
     ax.set_xlabel('Fluence for 1 dpa over the ROI, TRIM (ions/cm²)')
     ax.set_ylabel('Predicted by the surrogate (ions/cm²)')
-    ax.legend(loc='upper left', fontsize=7.5)
+    ax.legend(loc='upper left', bbox_to_anchor=(0.0, -0.13), fontsize=8)
     _save(fig, 'parity.png')
 
 
@@ -129,8 +131,9 @@ def overlay(group: str = 'Cu + CuCrZr', ion: str = 'Cu', target: str = 'CuCrZr',
         ax.fill_between(mean.depth_nm / 1e3, band[0], band[1], color=COLORS[k], alpha=0.18, lw=0)
         ax.plot(mean.depth_nm / 1e3, mean.dpa(1e15), color=COLORS[k], lw=2, ls='--')
         ax.plot(p.depth_nm / 1e3, p.dpa(1e15), color=COLORS[k], lw=1.1)
-        ax.annotate(f'{p.energy_eV / 1e6:.3g} MeV', xy=(p.depth_nm[np.argmax(p.dpa(1.0))] / 1e3, p.dpa(1e15).max()),
-                    xytext=(4, 4), textcoords='offset points', fontsize=8.5, color=INK)
+        peak = int(np.argmax(mean.dpa(1.0)))     # label the smooth predicted peak, not a noise spike in TRIM
+        ax.annotate(f'{p.energy_eV / 1e6:.3g} MeV', xy=(mean.depth_nm[peak] / 1e3, mean.dpa(1e15)[peak]),
+                    xytext=(6, 10), textcoords='offset points', fontsize=8.5, color=INK)
         k_true = p.dpa(1.0)
         x_max = max(x_max, p.depth_nm[k_true > 0.01 * k_true.max()].max() / 1e3)
     ax.set_xlim(0, 1.08 * x_max)
@@ -141,7 +144,7 @@ def overlay(group: str = 'Cu + CuCrZr', ion: str = 'Cu', target: str = 'CuCrZr',
     ax.legend(handles=[Line2D([], [], color=MUTED, lw=1.1, label='TRIM'),
                        Line2D([], [], color=MUTED, lw=2, ls='--', label='surrogate (mean)'),
                        Patch(color=MUTED, alpha=0.25, lw=0, label="surrogate's 80 % band")],
-              loc='upper left', fontsize=8.5)
+              loc='upper right', fontsize=8.5)
     _save(fig, 'overlay.png')
 
 

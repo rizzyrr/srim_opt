@@ -36,7 +36,9 @@ from scipy.stats import qmc
 import srim_core as core
 from srim_optimiser import LIGHT_COST
 
-WORKER_ROOT = os.environ.get('SRIM_WORKERS', os.path.join(os.path.dirname(core.DEFAULT_SRIM_DIR), 'SRIM_workers'))
+# Worker copies of SRIM sit next to the SRIM folder (SRIM_WORKERS overrides)
+WORKER_ROOT = os.environ.get('SRIM_WORKERS') or (
+    os.path.join(os.path.dirname(core.DEFAULT_SRIM_DIR.rstrip('\\/')), 'SRIM_workers') if core.DEFAULT_SRIM_DIR else '')
 DATASET_DIR = os.path.join(core.OUTPUT_DIR, 'dataset')
 PROGRESS_CSV = os.path.join(DATASET_DIR, 'progress.csv')
 
@@ -192,6 +194,9 @@ def cache_dir_for(kind: str) -> str:
 # ---------------------------------------------------------------------------
 
 def prepare_workers(n: int) -> List[str]:
+    err = core.check_srim_directory(core.DEFAULT_SRIM_DIR)
+    if err or not WORKER_ROOT:
+        raise SystemExit(err or 'Set SRIM_WORKERS to a folder for the worker copies of SRIM.')
     dirs = [os.path.join(WORKER_ROOT, f'w{k}') for k in range(n)]
     for d in dirs:
         if os.path.isfile(os.path.join(d, 'TRIM.exe')):

@@ -49,8 +49,42 @@ finally:
     yaml.load = _yaml_load
 
 NA = 6.02214076e23  # atoms/mol
-DEFAULT_SRIM_DIR = os.environ.get('SRIM_DIR', os.path.join(os.path.expanduser('~'), 'Documents', 'SRIM'))
 OUTPUT_DIR = os.path.join(os.path.dirname(os.path.abspath(__file__)), 'srim_outputs')
+SETTINGS_PATH = os.path.join(OUTPUT_DIR, 'settings.json')       # this machine's settings (not in git)
+
+
+STANDARD_SRIM_DIR = os.path.join(os.path.expanduser('~'), 'Documents', 'SRIM')   # the usual install place
+
+
+def saved_srim_dir() -> str:
+    # The SRIM folder: the SRIM_DIR environment variable, else the one last entered in the app, else
+    # ~/Documents/SRIM if SRIM is installed there, else ''
+    if os.environ.get('SRIM_DIR'):
+        return os.environ['SRIM_DIR']
+    try:
+        with open(SETTINGS_PATH) as f:
+            saved = json.load(f).get('srim_dir', '')
+    except (OSError, ValueError):
+        saved = ''
+    if saved:
+        return saved
+    return STANDARD_SRIM_DIR if os.path.isfile(os.path.join(STANDARD_SRIM_DIR, 'TRIM.exe')) else ''
+
+
+def save_srim_dir(srim_dir: str) -> None:
+    # Remember the SRIM folder for the next session (the app calls this once the folder checks out)
+    try:
+        with open(SETTINGS_PATH) as f:
+            settings = json.load(f)
+    except (OSError, ValueError):
+        settings = {}
+    settings['srim_dir'] = srim_dir
+    os.makedirs(OUTPUT_DIR, exist_ok=True)
+    with open(SETTINGS_PATH, 'w') as f:
+        json.dump(settings, f, indent=1)
+
+
+DEFAULT_SRIM_DIR = saved_srim_dir()
 CACHE_DIR = os.path.join(OUTPUT_DIR, 'cache')                  # runs made from the app and the optimiser
 DATASET_CACHE_DIR = os.path.join(OUTPUT_DIR, 'dataset_cache')  # surrogate training runs (srim_dataset.py)
 TEST_CACHE_DIR = os.path.join(OUTPUT_DIR, 'test_cache')        # high-statistics test runs, never trained on
@@ -426,6 +460,9 @@ def cached_profiles(min_ions: int = 31, cache_dir: str = CACHE_DIR) -> List[Dama
 
 def check_srim_directory(srim_dir: str) -> Optional[str]:
     # Return an error message if `srim_dir` does not look like a SRIM install
+    if not srim_dir:
+        return ('No SRIM folder set. Enter the folder that contains TRIM.exe in the sidebar, or set the SRIM_DIR '
+                'environment variable.')
     if not os.path.isdir(srim_dir):
         return f'Folder not found: {srim_dir}'
     if not os.path.isfile(os.path.join(srim_dir, 'TRIM.exe')):

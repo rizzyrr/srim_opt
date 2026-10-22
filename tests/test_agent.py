@@ -79,3 +79,46 @@ def test_unsupported_numbers_after_rewrite_are_reported():
     client = ScriptedClient([_message('99.9 hours.'), _message('Still 99.9 hours.')])
     reply = agent.Agent(client=client).ask('How long?')
     assert reply.unverified == ['99.9']
+
+
+# --- approval before TRIM ----------------------------------------------------------------------------------
+
+PLAN_ARGS = {'material': 'W', 'ion': 'W', 'target_dpa': 1, 'facility': 'Helsinki 5 MV tandem'}
+
+
+def _plan_client(final):
+    return ScriptedClient([_message(tool_calls=[_tool_call('plan_beam', PLAN_ARGS)]), _message(final)])
+
+
+def test_trim_run_waits_for_approval(monkeypatch):
+    ran = []
+    monkeypatch.setattr(agent.tools, 'call_tool', lambda *a, **k: ran.append(a) or json.dumps({'ok': True}))
+    a = agent.Agent(client=_plan_client('Confirmed.'))
+    reply = a.ask('Confirm with TRIM')
+    assert reply.pending == {'name': 'plan_beam', 'args': PLAN_ARGS} and reply.text == '' and not ran
+    try:
+        a.ask('something else')
+        assert False, 'a new question must wait for the approval'
+    except RuntimeError:
+        pass
+    reply = a.resume(True)
+    assert len(ran) == 1 and reply.text == 'Confirmed.' and reply.pending is None
+    assert reply.tool_calls[0]['name'] == 'plan_beam'
+
+
+def test_declined_trim_run_is_not_run_and_the_model_is_told(monkeypatch):
+    ran = []
+    monkeypatch.setattr(agent.tools, 'call_tool', lambda *a, **k: ran.append(a) or json.dumps({'ok': True}))
+    client = _plan_client('Keeping the prediction.')
+    a = agent.Agent(client=client)
+    a.ask('Confirm with TRIM')
+    reply = a.resume(False)
+    assert not ran and reply.text == 'Keeping the prediction.'
+    assert reply.tool_calls[0]['result']['declined'] is True
+    assert client.seen[-1][-1]['role'] == 'tool'   # the model saw the decline as the tool's answer
+
+
+def test_approval_can_be_switched_off(monkeypatch):
+    monkeypatch.setattr(agent.tools, 'call_tool', lambda *a, **k: json.dumps({'ok': True}))
+    reply = agent.Agent(client=_plan_client('Done.'), approval=False).ask('Confirm with TRIM')
+    assert reply.pending is None and reply.text == 'Done.'

@@ -100,8 +100,9 @@ the same way. Larger models are more reliable at filling in a beam specification
 2. Extract it to a folder, for example `C:\Users\<you>\Documents\SRIM`.
 3. Run the setup in its `SRIM-Setup` folder as administrator. On Windows 10 and 11, TRIM fails to start
    with a missing `.ocx` error without this step.
-4. Point srim_opt at the folder. Either set a user environment variable `SRIM_DIR` the same way as the
-   Groq key, or type the folder into the app's sidebar.
+4. Type the folder into **SRIM folder** at the top of the app's sidebar. Once TRIM.exe is found there, the
+   folder is remembered on this computer, in `srim_outputs/settings.json`, which is not in git. A user
+   environment variable `SRIM_DIR` overrides it. The terminal tools use the same setting.
 
 The SR range tables for the dataset's ion–target pairs are already in the repo, so predictions for those
 pairs work without SRIM.
@@ -119,13 +120,21 @@ assistant:
 4. Tells you which defaults it assumed (ROI start and width, ±10 % flatness, implant margin), passes on
    warnings, and explains failures with the value to change.
 
-Under each answer, **Tool calls** shows every tool call behind it, with the arguments and the full result.
+Under each prediction or confirmed result, two charts appear:
+- **Depth profile:** the dpa and implanted-ion profiles with the ROI and target marked. For a confirmed
+  result, TRIM's profile is drawn with the surrogate's prediction dashed over it.
+- **Energy scan:** the objective against beam energy.
+
+**Tool calls** shows every tool call behind the answer, with the arguments and the full result.
 
 **Terminal:** `.venv313\Scripts\python srim_agent.py` chats with the same assistant, and
-`srim_agent.py "question"` asks one question.
+`srim_agent.py "question"` asks one question. There are no charts in the terminal.
 
-**Without the AI:** the **Optimise (one-click)** tab gives the same answer from a form. The other tabs run
-single TRIM runs, energy sweeps and convergence checks.
+**Without the AI:** the app has four main tabs.
+- **Optimise → One-click** gives the same answer from a form, using the ion and material set in the sidebar.
+- **Optimise → Manual grid** runs TRIM on an energy grid you choose.
+- **More tools** holds single TRIM runs, energy sweeps, fluence and ROI, run comparison and convergence
+  checks.
 
 ### How the assistant keeps to the physics
 

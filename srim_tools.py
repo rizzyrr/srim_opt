@@ -158,14 +158,31 @@ def energy_window(ion: str, facility: Optional[str] = None) -> dict:
     return {'facility': facility, 'ion': ion, 'e_min_MeV': e_min, 'e_max_MeV': e_max, 'notes': notes}
 
 
-_RESULT_FIELDS = ('energy_MeV', 'fluence', 'fluence_min', 'fluence_max', 'roi_start_nm', 'roi_end_nm',
-                  'roi_width_nm', 'dpa_min_in_roi', 'dpa_max_in_roi', 'peak_dpa', 'max_implanted_appm_in_roi',
-                  'beam_setting')
+_RESULT_FIELDS = ('energy_MeV', 'fluence', 'roi_start_nm', 'roi_end_nm', 'roi_width_nm', 'dpa_min_in_roi',
+                  'dpa_max_in_roi', 'peak_dpa', 'max_implanted_appm_in_roi', 'beam_setting')
 
 
-def screen_beam(srim_dir: Optional[str] = None, **args) -> dict:
-    spec = _spec(args)
-    r = opt.screen(_material(args), args['ion'], spec, srim_dir=srim_dir or core.DEFAULT_SRIM_DIR).to_dict()
+def _numbers(r: dict, spec: opt.BeamSpec) -> dict:
+    # The result fields the model may quote. fluence_min/max are renamed: they are the fluences that keep the
+    # ROI mean within the dpa tolerance, not an uncertainty (a model read them as "model min/max")
+    out = {k: r.get(k) for k in _RESULT_FIELDS}
+    if r.get('fluence_min') is not None:
+        out['fluence_range_for_dpa_tolerance'] = {'tolerance_dpa': spec.tol_dpa,
+                                                  'fluence': [r['fluence_min'], r['fluence_max']]}
+    return out
+
+
+def _keep(raw: Optional[dict], material, spec: opt.BeamSpec, result) -> None:
+    # The untrimmed result for the caller (the app draws charts from it); never sent to the model
+    if raw is not None:
+        raw.update(material=material, spec=spec, result=result)
+
+
+def screen_beam(srim_dir: Optional[str] = None, raw: Optional[dict] = None, **args) -> dict:
+    spec, material = _spec(args), _material(args)
+    result = opt.screen(material, args['ion'], spec, srim_dir=srim_dir or core.DEFAULT_SRIM_DIR)
+    _keep(raw, material, spec, result)
+    r = result.to_dict()
     out = {'status': ('NOT FEASIBLE with this energy window (from SR range tables, not the surrogate model)'
                       if not r['ok']
                       else 'PREDICTED (surrogate model, not verified by TRIM)' if r['source'] == 'surrogate'
@@ -175,23 +192,25 @@ def screen_beam(srim_dir: Optional[str] = None, **args) -> dict:
            'flags': r['flags'], 'defaults_used': _defaults_used(args)}
     if r['best']:
         best = r['best']
-        out['prediction'] = {k: best.get(k) for k in _RESULT_FIELDS}
-        out['prediction']['fluence_80pct_band'] = best['band'].get('fluence')
+        out['prediction'] = _numbers(best, spec)
+        out['prediction']['fluence_80pct_uncertainty_band'] = best['band'].get('fluence')
         out['prediction']['uncertainty'] = best['uncertainty']
     return out
 
 
 def plan_beam(progress: Optional[Callable[[str, int, int, str], None]] = None, srim_dir: Optional[str] = None,
-              **args) -> dict:
-    spec = _spec(args)
-    r = opt.plan(_material(args), args['ion'], spec, srim_dir=srim_dir or core.DEFAULT_SRIM_DIR,
-                 progress=progress, minimised=True).to_dict()
+              raw: Optional[dict] = None, **args) -> dict:
+    spec, material = _spec(args), _material(args)
+    result = opt.plan(material, args['ion'], spec, srim_dir=srim_dir or core.DEFAULT_SRIM_DIR,
+                      progress=progress)   # TRIM's window stays visible: the run was approved by a person
+    _keep(raw, material, spec, result)
+    r = result.to_dict()
     out = {'status': 'CONFIRMED by TRIM simulation' if r['ok'] else 'FAILED',
            'ok': r['ok'], 'message': r['message'], 'material': r['material'], 'ion': r['ion'],
            'energy_window_MeV': r['energy_window_MeV'], 'flags': r['flags'],
            'defaults_used': _defaults_used(args), 'trim_runs': len(r['runs']), 'elapsed_s': r['elapsed_s']}
     if r['ok']:
-        out['result'] = {k: r.get(k) for k in _RESULT_FIELDS}
+        out['result'] = _numbers(r, spec)
         if r['prediction']:
             out['surrogate_predicted'] = {k: r['prediction'].get(k) for k in ('energy_MeV', 'fluence')}
         out['method'] = r['provenance']
@@ -212,17 +231,19 @@ FUNCTIONS: Dict[str, Callable[..., dict]] = {
 }
 
 
-def call_tool(name: str, args: Optional[dict] = None, progress=None, srim_dir: Optional[str] = None) -> str:
+def call_tool(name: str, args: Optional[dict] = None, progress=None, srim_dir: Optional[str] = None,
+              raw: Optional[dict] = None) -> str:
     # One tool call from the model. Failures come back as {"ok": false, "message": ...} so the model can tell
     # the user or fix its arguments, instead of the chat crashing. srim_dir is the caller's, never the model's.
-    args = {k: v for k, v in (args or {}).items() if k not in ('srim_dir', 'progress')}
+    # Pass a dict as raw to receive the untrimmed screen/plan result alongside (for charts).
+    args = {k: v for k, v in (args or {}).items() if k not in ('srim_dir', 'progress', 'raw')}
     try:
         if name not in FUNCTIONS:
             raise ValueError(f'Unknown tool "{name}". Tools: {", ".join(FUNCTIONS)}.')
         if name == 'plan_beam':
-            out = plan_beam(progress=progress, srim_dir=srim_dir, **args)
+            out = plan_beam(progress=progress, srim_dir=srim_dir, raw=raw, **args)
         elif name == 'screen_beam':
-            out = screen_beam(srim_dir=srim_dir, **args)
+            out = screen_beam(srim_dir=srim_dir, raw=raw, **args)
         else:
             out = FUNCTIONS[name](**args)
     except (ValueError, KeyError, TypeError) as e:

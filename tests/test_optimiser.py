@@ -55,6 +55,16 @@ def test_pick_best_takes_the_widest_energy():
     assert opt.pick_best([(5.0, None)], spec) is None
 
 
+def test_pick_predicted_breaks_width_ties_towards_higher_energy():
+    spec = opt.BeamSpec(target_dpa=1.0)
+    pts = [(4.15, window(294, 2e15)), (5.92, window(282, 3e15)), (8.45, window(280, 5e15)), (2.0, window(150, 1e15))]
+    assert opt.pick_predicted(pts, spec) == 8.45          # within 15 % of the widest: the highest energy
+    pts = [(4.15, window(400, 2e15)), (8.45, window(300, 5e15))]
+    assert opt.pick_predicted(pts, spec) == 4.15          # clearly wider wins
+    fluence_spec = opt.BeamSpec(target_dpa=1.0, objective='fluence')
+    assert opt.pick_predicted(pts, fluence_spec) == opt.pick_best(pts, fluence_spec)
+
+
 def test_search_nothing_feasible():
     assert opt._search(FakeRuns('width', lambda E: None), 1.0, 10.0) is None
 

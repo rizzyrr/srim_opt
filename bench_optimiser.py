@@ -1,10 +1,11 @@
 # Optimiser benchmark: how many TRIM runs (and how much TRIM time) each strategy needs to choose the beam
 # energy, and how good its choice is, for five realistic cases.
 #
-# Ground truth is the dense reference sweep of each case (12 energies, 300 ions, made by srim_dataset.py).
-# Every strategy "runs TRIM" by looking up the nearest reference energy and pays the TRIM time measured for
-# that run, so the comparison costs no new TRIM time. The surrogate is retrained without the five benchmark
-# ion-target pairs, so it predicts combinations it has never seen.
+# Each case has dense reference sweeps (12 energies, at 300 and at 1000 ions, made by srim_dataset.py). Every
+# strategy "runs TRIM" by looking up the nearest reference energy inside the case's energy window, from the
+# sweep with the ion count it asked for, and pays the TRIM time measured for that run, so the comparison
+# costs no new TRIM time. Choices are scored on the 1000-ion sweep. The surrogate is retrained without the
+# five benchmark ion-target pairs, so it predicts combinations it has never seen.
 #
 #   python bench_optimiser.py             comparison table, saved to srim_outputs/benchmark/
 #   python bench_optimiser.py --confirm   also run the real one-click plan() for each case
@@ -39,35 +40,46 @@ CASES: List[Tuple[str, str, opt.BeamSpec]] = [
 ]
 
 
+TRUTH_IONS = 1000
+
+
 class Oracle:
-    # Stands in for TRIM: answers from the reference sweep at the nearest energy, and keeps the bill
-    def __init__(self, refs: Dict[float, core.DamageProfile], spec: opt.BeamSpec):
-        self.refs, self.spec = refs, spec
-        self.energies = np.array(sorted(refs))
+    # Stands in for TRIM: answers from the reference sweeps at the nearest energy in the window (the 300-ion
+    # sweep for runs of fewer than 1000 ions, the 1000-ion sweep otherwise), and keeps the bill
+    def __init__(self, sweeps: Dict[int, Dict[float, core.DamageProfile]], spec: opt.BeamSpec,
+                 e_lo: float, e_hi: float):
+        self.sweeps = {n: {E: p for E, p in s.items() if e_lo * 0.999 <= E <= e_hi * 1.001}
+                       for n, s in sweeps.items()}
+        self.spec = spec
+        self.energies = np.array(sorted(self.sweeps[TRUTH_IONS]))
         self.points: Dict[float, tuple] = {}
-        self.bill: Dict[float, int] = {}   # energy -> most ions paid for there
-        self.path = ''                     # how the strategy chose (for the surrogate: used, or fell back)
+        self.bill: Dict[Tuple[float, int], int] = {}   # (energy, ions) of every run paid for
+        self.path = ''                                 # how the strategy chose (for the surrogate: used, or fell back)
 
     def snap(self, E: float) -> float:
         return float(self.energies[np.argmin(np.abs(np.log(self.energies / E)))])
 
+    def profile(self, E: float, n: int) -> core.DamageProfile:
+        return self.sweeps[dataset.TRAIN_IONS if n < TRUTH_IONS else TRUTH_IONS][E]
+
     def truth(self, E: float) -> Optional[dict]:
-        return opt.evaluate(self.refs[E], self.spec)
+        return opt.evaluate(self.sweeps[TRUTH_IONS][E], self.spec)
 
     def run(self, E: float, n: int, stage: str):
         E = self.snap(E)
-        r = self.truth(E)
+        p = self.profile(E, n)
+        r = opt.evaluate(p, self.spec)
         self.bill[(E, n)] = n
         if stage == 'search':
-            self.points[E] = (self.refs[E], r)
-        return self.refs[E], r
+            self.points[E] = (p, r)
+        return p, r
 
     def affordable(self, E: float, confirm_E: float) -> bool:
         return True
 
     def cost(self) -> Tuple[int, int, float]:
         # (TRIM runs, ion histories, minutes) using the measured time of the reference run at each energy
-        minutes = sum(self.refs[E].meta.get('wall_s', 0.0) * n / self.refs[E].number_ions / 60
+        minutes = sum(self.profile(E, n).meta.get('wall_s', 0.0) * n / self.profile(E, n).number_ions / 60
                       for (E, n) in self.bill)
         return len(self.bill), sum(self.bill.values()), minutes
 
@@ -98,9 +110,9 @@ def surrogate_strategy(o: Oracle, model: sur.Surrogate, material: core.Material,
     # One-click with the surrogate: choose among the reference energies from predictions alone, confirm once,
     # and search around the proposal with TRIM only if the confirmation finds no valid ROI. Like plan(), it
     # searches with TRIM instead when the surrogate sees no valid ROI or is unsure.
-    window = [E for E in o.energies if e_lo * 0.999 <= E <= e_hi * 1.001]
+    window = [float(E) for E in o.energies]
     preds = model.predict_profiles(material, ion, np.array(window) * 1e6)
-    E = opt.pick_best([(E, opt.evaluate(p, o.spec)) for E, p in zip(window, preds)], o.spec)
+    E = opt.pick_predicted([(E, opt.evaluate(p, o.spec)) for E, p in zip(window, preds)], o.spec)
     if E is None:
         o.path = 'search (surrogate sees no valid ROI)'
         return search_strategy(o, e_lo, e_hi)
@@ -118,12 +130,12 @@ def surrogate_strategy(o: Oracle, model: sur.Surrogate, material: core.Material,
     return E
 
 
-def reference_sweep(ion: str, target: str) -> Dict[float, core.DamageProfile]:
+def reference_sweep(ion: str, target: str, n_ions: int, runs=None) -> Dict[float, core.DamageProfile]:
     wanted = {float(f'{E:.3g}') for E in dataset.BENCHMARK_ENERGIES_MEV}
     refs = {}
-    for name, p, _ in sur.load_runs():
+    for name, p, _ in runs if runs is not None else sur.load_runs():
         E = float(f'{p.energy_eV / 1e6:.3g}')
-        if name == target and p.ion_symbol == ion and E in wanted and p.number_ions == dataset.TRAIN_IONS:
+        if name == target and p.ion_symbol == ion and E in wanted and p.number_ions == n_ions:
             refs[E] = p
     return refs
 
@@ -135,13 +147,15 @@ def benchmark() -> pd.DataFrame:
     model = sur.Surrogate.fit(sur.build_training_set([r for r in runs if (r[0], r[1].ion_symbol) not in held_pairs]))
     rows = []
     for ion, target, spec in CASES:
-        refs = reference_sweep(ion, target)
+        sweeps = {n: reference_sweep(ion, target, n, runs) for n in dataset.BENCHMARK_IONS}
         e_lo, e_hi, _ = spec.energy_limits(ion)
-        in_window = [E for E in refs if e_lo * 0.999 <= E <= e_hi * 1.001]
-        if len(in_window) < len([E for E in dataset.BENCHMARK_ENERGIES_MEV if e_lo * 0.999 <= E <= e_hi * 1.001]):
-            print(f'{ion} -> {target}: reference sweep not finished yet ({len(in_window)} energies); skipped')
+        needed = sum(e_lo * 0.999 <= float(f'{E:.3g}') <= e_hi * 1.001 for E in dataset.BENCHMARK_ENERGIES_MEV)
+        have = {n: sum(e_lo * 0.999 <= E <= e_hi * 1.001 for E in s) for n, s in sweeps.items()}
+        if min(have.values()) < needed:
+            print(f'{ion} -> {target}: reference sweeps not finished yet ({have} of {needed} energies); skipped')
             continue
-        truth = Oracle(refs, spec)
+        truth = Oracle(sweeps, spec, e_lo, e_hi)
+        in_window = [float(E) for E in truth.energies]
         best_true = opt.pick_best([(E, truth.truth(E)) for E in in_window], spec)
         best_val = opt.objective_value(truth.truth(best_true), spec.objective) if best_true else None
         material = core.MATERIALS[target]
@@ -149,7 +163,7 @@ def benchmark() -> pd.DataFrame:
                           ('search: 300-ion runs + 1 confirmation', lambda o: search_strategy(o, e_lo, e_hi)),
                           ('surrogate: predicted, then 1 confirmation',
                            lambda o: surrogate_strategy(o, model, material, ion, e_lo, e_hi))]:
-            o = Oracle(refs, spec)
+            o = Oracle(sweeps, spec, e_lo, e_hi)
             chosen = fn(o)
             n_runs, histories, minutes = o.cost()
             val = opt.objective_value(o.truth(chosen), spec.objective) if chosen else None

@@ -39,9 +39,11 @@ SELF_ION = {'CuCrZr': 'Cu', 'Fe-9Cr': 'Fe', 'SiC': 'Si'}   # for pure elements t
 STRATA_MEV = [(0.5, 1.0, 1), (1.0, 20.0, 7), (20.0, 50.0, 2)]
 TRAIN_IONS = 300
 
-# Dense reference sweeps for the optimiser benchmark (ion, target)
+# Dense reference sweeps for the optimiser benchmark (ion, target), at the optimiser's two ion counts: its
+# search runs see 300-ion noise, its confirmation runs and the benchmark's ground truth use 1000 ions
 BENCHMARK_PAIRS = [('Cu', 'CuCrZr'), ('Fe', 'Fe-9Cr'), ('W', 'W'), ('Ni', 'Ni'), ('Si', 'SiC')]
 BENCHMARK_ENERGIES_MEV = np.geomspace(1.0, 50.0, 12)
+BENCHMARK_IONS = (TRAIN_IONS, 1000)
 
 # Parts of the SRIM install the worker copies leave out: the installer and the manuals. TRIM silently
 # writes no output if its other folders are missing (e.g. 'SRIM Restore'), so everything else is copied.
@@ -82,8 +84,8 @@ def plan_jobs() -> List[Job]:
     # Every planned run, in a fixed shuffled order so that a partly finished set still covers the whole space
     jobs = [('train', ion, t, E * 1e6, TRAIN_IONS) for t in TARGETS for ion in ions_for(t)
             for E in pair_energies_MeV(ion, t)]
-    jobs += [('bench', ion, t, float(f'{E:.3g}') * 1e6, TRAIN_IONS)
-             for ion, t in BENCHMARK_PAIRS for E in BENCHMARK_ENERGIES_MEV]
+    jobs += [('bench', ion, t, float(f'{E:.3g}') * 1e6, n)
+             for n in BENCHMARK_IONS for ion, t in BENCHMARK_PAIRS for E in BENCHMARK_ENERGIES_MEV]
     order = np.random.default_rng(0).permutation(len(jobs))
     return [jobs[i] for i in order]
 
@@ -254,8 +256,8 @@ def write_datasheet(df: pd.DataFrame, path: str) -> None:
     text = f"""# Heavy-ion damage profiles in fusion and fission materials (SRIM-2013, Quick K-P)
 
 {len(df)} TRIM runs: {df['ion'].nunique()} ions into {df['target'].nunique()} targets,
-{df['energy_MeV'].min():.2g}-{df['energy_MeV'].max():.3g} MeV, {TRAIN_IONS} ions per run. Made with srim_opt
-(`srim_dataset.py`) to train a fast surrogate for planning ion irradiations.
+{df['energy_MeV'].min():.2g}-{df['energy_MeV'].max():.3g} MeV, {TRAIN_IONS} ions per run ({(df['number_ions'] > TRAIN_IONS).sum()} benchmark
+runs with 1000). Made with srim_opt (`srim_dataset.py`) to train a fast surrogate for planning ion irradiations.
 
 ## How each run was made
 - SRIM-2013 TRIM (driven by pysrim), "Ion distribution and quick calculation of damage" (Quick Kinchin-Pease).
@@ -266,7 +268,7 @@ def write_datasheet(df: pd.DataFrame, path: str) -> None:
 - Target thickness 1.4 x (projected range + 3 straggling) from SRIM's stopping and range tables, so the 100
   depth bins resolve the profile at every energy; thickened and re-run if ions reached the back.
 - Energies per ion-target pair: 1 in 0.5-1 MeV, 7 in 1-20 MeV, 2 in 20-50 MeV (scrambled log-uniform), plus
-  12-energy sweeps for five benchmark pairs.
+  12-energy sweeps (1-50 MeV, at 300 and at 1000 ions) for five benchmark pairs.
 
 ## Targets (runs)
 {targets}
@@ -285,7 +287,8 @@ Ions: {', '.join(sorted(df['ion'].unique()))}.
 ## Caveats
 - SRIM treats the target as amorphous: no channelling or crystal effects.
 - Quick K-P damage, not full-cascade; NRT dpa, not arc-dpa.
-- {TRAIN_IONS} ions per run: bin-to-bin Monte Carlo noise of a few per cent.
+- {TRAIN_IONS} ions per run: bin-to-bin Monte Carlo noise of a few per cent, enough to make or break a
+  narrow-tolerance flat window; check such windows with more ions.
 - SRIM's electronic stopping is less accurate for slow heavy ions in light targets.
 """
     with open(path, 'w', encoding='utf-8') as f:

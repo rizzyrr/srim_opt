@@ -260,6 +260,24 @@ def pick_best(points: List[Tuple[float, Optional[dict]]], spec: BeamSpec) -> Opt
     return min(feas, key=lambda t: (score(t[1], spec.objective), t[0]))[0]
 
 
+SURROGATE_WIDTH_TIE = 0.15   # predicted ROI widths this close to the widest count as tied (see pick_predicted)
+
+
+def pick_predicted(points: List[Tuple[float, Optional[dict]]], spec: BeamSpec) -> Optional[float]:
+    # Best energy from surrogate predictions. Its ROI widths are uncertain by 20-25 % (srim_surrogate.py
+    # validate), more than the differences between the top energies, so for the widest-ROI objective the
+    # energies within SURROGATE_WIDTH_TIE of the widest tie and the highest wins: more energy leaves more room
+    # before the implant limit, and in TRIM the widest flat window is nearly always at the top of the window.
+    # The TRIM confirmation run then has the last word.
+    if spec.objective != 'width':
+        return pick_best(points, spec)
+    feas = [(E, r) for E, r in points if r is not None]
+    if not feas:
+        return None
+    w_max = max(r['roi_width_nm'] for _, r in feas)
+    return max(E for E, r in feas if r['roi_width_nm'] >= (1 - SURROGATE_WIDTH_TIE) * w_max)
+
+
 def score(r: Optional[dict], objective: str) -> Tuple[float, float]:
     # Lower is better; ties go to the lower fluence. Infeasible windows score infinity.
     if r is None:
@@ -569,7 +587,7 @@ def _surrogate_proposal(surrogate, material, name, ion, spec, e_lo, e_hi, n_ener
     energies = np.geomspace(e_lo, e_hi, n_energies)
     profiles = model.predict_profiles(material, ion, energies * 1e6, table=table)
     results = [evaluate(p, spec) for p in profiles]
-    best_E = pick_best(list(zip(range(len(results)), results)), spec)   # indices stand in for energies
+    best_E = pick_predicted(list(zip(range(len(results)), results)), spec)   # indices stand in for energies
     if best_E is None:
         return None   # the surrogate sees no valid ROI: let TRIM check that
     best = int(best_E)

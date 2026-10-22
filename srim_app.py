@@ -922,7 +922,7 @@ with tab_one:
     oc_width = c4.number_input('Minimum ROI width (nm)', min_value=1.0, value=100.0, key='oc_width')
     c1, c2, c3, c4 = st.columns(4)
     oc_obj = c1.selectbox('Optimise for', list(core.OBJECTIVES), format_func=core.OBJECTIVES.get, key='oc_obj',
-                          index=list(core.OBJECTIVES).index('width'),   # BeamSpec's default, as OPTIMISER_PROBLEM.md decided
+                          index=list(core.OBJECTIVES).index('width'),   # BeamSpec's default
                           help='Widest ROI: windows within 5 % of the widest count as equal, and the one needing '
                                'the lowest fluence wins.')
     oc_imode = c2.radio('Implant limit', ['distance', 'percent'], horizontal=True, key='oc_imode',

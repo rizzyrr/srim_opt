@@ -440,7 +440,7 @@ def evaluate_on(model: Surrogate, runs: Sequence[Tuple[str, core.DamageProfile, 
     for name, p, _ in runs:
         pred = model.predict_profiles(p.material, p.ion_symbol, [p.energy_eV])[0]
         rows.append({'target': name, 'ion': p.ion_symbol, 'energy_MeV': p.energy_eV / 1e6,
-                     'uncertainty': pred.meta['uncertainty'], **compare(p, pred)})
+                     'number_ions': p.number_ions, 'uncertainty': pred.meta['uncertainty'], **compare(p, pred)})
     return rows
 
 

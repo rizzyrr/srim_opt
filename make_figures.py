@@ -80,7 +80,8 @@ def parity() -> None:
         return
     every = pd.read_csv(path).dropna(subset=['fluence_error'])    # runs where TRIM has an ROI window
     # Medians count a prediction with no damage in the window as an infinite error; only finite points plot
-    stats = {g: (100 * np.median(np.abs(x.fluence_error)), len(x), int(np.isinf(x.fluence_error).sum()))
+    stats = {g: (100 * np.median(np.abs(x.fluence_error)), len(x), int(np.isinf(x.fluence_error).sum()),
+                 'in_domain' in x and not x.in_domain.any())
              for g, x in every.groupby('holdout', sort=False)}
     df = every[np.isfinite(every.fluence_1dpa_pred)]
     lo = 0.6 * min(df.fluence_1dpa_trim.min(), df.fluence_1dpa_pred.min())
@@ -89,12 +90,14 @@ def parity() -> None:
     fig, ax = plt.subplots(figsize=(5.0, 4.8))
     ax.fill_between(xs, xs / 1.2, xs * 1.2, color=GRID, alpha=0.7, lw=0, label='within 20 %')
     ax.plot(xs, xs, color=MUTED, lw=0.8)
-    for k, (group, g) in enumerate(df.groupby('holdout', sort=False)):
-        err, n, no_damage = stats[group]
-        ax.scatter(g.fluence_1dpa_trim, g.fluence_1dpa_pred, s=24, marker=MARKERS[k % 4], color=COLORS[k % 4],
-                   edgecolor='white', linewidth=0.6, zorder=3,
+    groups = list(df.groupby('holdout', sort=False))
+    for k, (group, g) in enumerate(groups):
+        err, n, no_damage, all_outside = stats[group]
+        ax.scatter(g.fluence_1dpa_trim, g.fluence_1dpa_pred, s=20, marker=MARKERS[k % 4], color=COLORS[k % 4],
+                   edgecolor='white', linewidth=0.5, zorder=3 + len(groups) - k,    # first group drawn on top
                    label=f'{HOLDOUT_LABELS.get(group, group)}: median error {err:.0f} % (n = {n}'
-                         + (f'; {no_damage} predicted no damage, not shown' if no_damage else '') + ')')
+                         + (f'; {no_damage} predicted no damage, not shown' if no_damage else '')
+                         + ('; all flagged out of domain' if all_outside else '') + ')')
     ax.set_xscale('log')
     ax.set_yscale('log')
     ax.set_xlim(lo, hi)
@@ -194,8 +197,9 @@ def benchmark() -> None:
             if pd.isna(minutes):
                 continue
             verdict = 'no answer' if pd.isna(short) else ('best energy' if short < 0.005 else f'{short:.0%} short of best')
-            ax.text(minutes, yi, f'  {n:.0f} runs, {verdict}', va='center', fontsize=7.5, color=MUTED)
-    ax.set_yticks(np.arange(len(cases)), cases)
+            ax.text(minutes, yi, f'  {n:.0f} run{"s" if n != 1 else ""}, {verdict}', va='center', fontsize=7.5,
+                    color=MUTED)
+    ax.set_yticks(np.arange(len(cases)), [c.replace('->', '→') for c in cases])
     ax.invert_yaxis()
     ax.grid(axis='y', visible=False)
     ax.set_xlim(0, 1.45 * df.trim_minutes.max())

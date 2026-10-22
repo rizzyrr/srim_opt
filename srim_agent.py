@@ -25,6 +25,7 @@ import srim_tools as tools
 DEFAULT_MODEL = 'openai/gpt-oss-120b'
 MAX_STEPS = 10            # model calls per question, tool rounds included
 MAX_REWRITES = 1          # times an answer with unsupported numbers is sent back
+NEEDS_APPROVAL = {'plan_beam'}   # tools that run TRIM for minutes: a person approves each call
 
 SYSTEM_PROMPT = """You help nuclear materials scientists plan heavy-ion irradiation experiments: which ion \
 energy and fluence give a target dpa (displacements per atom) in a region of interest (ROI) below the \
@@ -47,7 +48,8 @@ checked, say so.
 5b. Say where numbers come from: "status" in each result tells you (surrogate prediction, SR ranges, or \
 TRIM).
 6. Use screen_beam first. plan_beam runs TRIM for 2-15 minutes: call it only when the user asks for \
-verified or confirmed numbers.
+verified or confirmed numbers. The user then approves the run; if they decline, keep the prediction and do \
+not ask again.
 7. Be brief and concrete. The users are physicists: use units, skip basics. For a beam answer: one sentence \
 with the answer and whether it is predicted or confirmed, then a two-column table (Quantity | Value) with \
 these rows when the result has them: beam energy, fluence, ROI depth (start-end and width), dpa range in the \
@@ -132,6 +134,7 @@ class Reply:
     text: str
     unverified: List[str] = field(default_factory=list)   # numbers no tool or user gave (should be empty)
     tool_calls: List[dict] = field(default_factory=list)  # {name, args, result} in order
+    pending: Optional[dict] = None   # {name, args} of a TRIM run waiting for approval; text is '' until resume()
 
 
 EventFn = Callable[[str, dict], None]   # ('tool_call' | 'tool_result' | 'progress' | 'rewrite', data)
@@ -141,8 +144,11 @@ class Agent:
     """A conversation. ask() can be called repeatedly; the history is kept in self.messages."""
 
     def __init__(self, model: Optional[str] = None, client=None, temperature: float = 0.2,
-                 srim_dir: Optional[str] = None, charts: bool = False):
+                 srim_dir: Optional[str] = None, charts: bool = False, approval: bool = True):
         self.srim_dir = srim_dir   # SRIM folder for screen_beam and plan_beam (default: srim_core's)
+        self.approval = approval   # hold NEEDS_APPROVAL calls until a person approves them (resume)
+        self.pending: Optional[dict] = None
+        self._turn = {'calls': [], 'rejected': []}
         prompt = SYSTEM_PROMPT + (CHARTS_NOTE if charts else '')
         if client is None:
             from groq import Groq
@@ -168,10 +174,32 @@ class Agent:
                 time.sleep(5 * (attempt + 1))
 
     def ask(self, text: str, on_event: Optional[EventFn] = None) -> Reply:
-        emit = on_event or (lambda kind, data: None)
+        if self.pending:
+            raise RuntimeError('A TRIM run is waiting for approval: call resume() first.')
         self.messages.append({'role': 'user', 'content': text})
         self.sources.append(text)
-        calls, rejected = [], []
+        self._turn = {'calls': [], 'rejected': []}
+        return self._loop(on_event or (lambda kind, data: None))
+
+    def resume(self, approved: bool, on_event: Optional[EventFn] = None) -> Reply:
+        """Answer the pending approval: run the held tool call (or tell the model it was declined) and carry on."""
+        emit = on_event or (lambda kind, data: None)
+        held, self.pending = self.pending, None
+        if held is None:
+            raise RuntimeError('Nothing is waiting for approval.')
+        if approved:
+            self._execute(held['id'], held['name'], held['args'], emit)
+        else:
+            declined = json.dumps({'ok': False, 'declined': True, 'message': (
+                'The user chose not to run TRIM now. Do not call plan_beam again unless they ask for it; '
+                'the screen_beam prediction stands, labelled as predicted.')})
+            self._record(held['id'], held['name'], held['args'], declined, None, emit)
+        if self._process(held['queue'], emit):
+            return self._paused()
+        return self._loop(emit)
+
+    def _loop(self, emit: EventFn) -> Reply:
+        calls, rejected = self._turn['calls'], self._turn['rejected']
         for _ in range(MAX_STEPS):
             msg = self._complete().choices[0].message
             if msg.tool_calls:
@@ -179,24 +207,15 @@ class Agent:
                     {'id': c.id, 'type': 'function',
                      'function': {'name': c.function.name, 'arguments': c.function.arguments}}
                     for c in msg.tool_calls]})
+                queue = []
                 for c in msg.tool_calls:
                     try:
                         args = json.loads(c.function.arguments or '{}')
                     except json.JSONDecodeError:
                         args = None
-                    emit('tool_call', {'name': c.function.name, 'args': args})
-                    raw = {}
-                    result = (tools.call_tool(c.function.name, args, srim_dir=self.srim_dir, raw=raw,
-                                              progress=lambda *p: emit('progress', dict(zip(
-                                                  ('stage', 'step', 'total', 'message'), p))))
-                              if args is not None else
-                              json.dumps({'ok': False, 'message': 'Arguments were not valid JSON.'}))
-                    # raw (full result objects, for charts) stays local; only `result` goes to the model
-                    calls.append({'name': c.function.name, 'args': args, 'result': json.loads(result),
-                                  'raw': raw or None})
-                    emit('tool_result', calls[-1])
-                    self.sources.append(result)
-                    self.messages.append({'role': 'tool', 'tool_call_id': c.id, 'content': result})
+                    queue.append((c.id, c.function.name, args))
+                if self._process(queue, emit):
+                    return self._paused()
                 continue
 
             answer = msg.content or ''
@@ -214,6 +233,37 @@ class Agent:
             self.messages = [m for m in self.messages if not any(m is r for r in rejected)]
             return Reply(answer, bad, calls)
         return Reply('I could not finish this within the step limit. Try a narrower question.', [], calls)
+
+    def _process(self, queue: List[tuple], emit: EventFn) -> bool:
+        # Run the model's tool calls in order. A call that needs approval is held, with the calls after it,
+        # and True is returned: the turn pauses until resume().
+        while queue:
+            call_id, name, args = queue.pop(0)
+            if self.approval and name in NEEDS_APPROVAL and args is not None:
+                self.pending = {'id': call_id, 'name': name, 'args': args, 'queue': queue}
+                emit('approval', {'name': name, 'args': args})
+                return True
+            self._execute(call_id, name, args, emit)
+        return False
+
+    def _execute(self, call_id: str, name: str, args: Optional[dict], emit: EventFn):
+        emit('tool_call', {'name': name, 'args': args})
+        raw = {}
+        result = (tools.call_tool(name, args, srim_dir=self.srim_dir, raw=raw,
+                                  progress=lambda *p: emit('progress', dict(zip(
+                                      ('stage', 'step', 'total', 'message'), p))))
+                  if args is not None else json.dumps({'ok': False, 'message': 'Arguments were not valid JSON.'}))
+        self._record(call_id, name, args, result, raw or None, emit)
+
+    def _record(self, call_id: str, name: str, args, result: str, raw: Optional[dict], emit: EventFn):
+        # raw (full result objects, for charts) stays local; only `result` goes to the model
+        self._turn['calls'].append({'name': name, 'args': args, 'result': json.loads(result), 'raw': raw})
+        emit('tool_result', self._turn['calls'][-1])
+        self.sources.append(result)
+        self.messages.append({'role': 'tool', 'tool_call_id': call_id, 'content': result})
+
+    def _paused(self) -> Reply:
+        return Reply('', [], self._turn['calls'], pending={'name': self.pending['name'], 'args': self.pending['args']})
 
 
 # ---------------------------------------------------------------------------
@@ -246,6 +296,11 @@ def main(argv: List[str]):
         if not q:
             continue
         reply = agent.ask(q, _print_event)
+        while reply.pending:
+            a = reply.pending['args']
+            ok = input(f"\nRun TRIM to confirm ({a.get('ion')} into {a.get('material') or a.get('composition')}, "
+                       f"{a.get('target_dpa')} dpa)? It usually takes 2-15 minutes. [y/N] ").strip().lower()
+            reply = agent.resume(ok in ('y', 'yes'), _print_event)
         print(f'\nagent> {reply.text}\n')
         if reply.unverified:
             print(f'WARNING: these numbers did not come from a tool: {", ".join(reply.unverified)}\n')

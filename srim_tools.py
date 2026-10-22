@@ -202,7 +202,7 @@ def plan_beam(progress: Optional[Callable[[str, int, int, str], None]] = None, s
               raw: Optional[dict] = None, **args) -> dict:
     spec, material = _spec(args), _material(args)
     result = opt.plan(material, args['ion'], spec, srim_dir=srim_dir or core.DEFAULT_SRIM_DIR,
-                      progress=progress, minimised=True)
+                      progress=progress)   # TRIM's window stays visible: the run was approved by a person
     _keep(raw, material, spec, result)
     r = result.to_dict()
     out = {'status': 'CONFIRMED by TRIM simulation' if r['ok'] else 'FAILED',

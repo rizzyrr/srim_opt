@@ -5,6 +5,7 @@
 
 import json
 import os
+import re
 
 import numpy as np
 import pandas as pd
@@ -620,6 +621,84 @@ def _show_chat_turn(turn, n):
             st.warning(f"These numbers did not come from a tool and may be wrong: {', '.join(turn['unverified'])}")
 
 
+def _run_chat_step(step):
+    # Run one agent step (a new question, or the answer to a TRIM approval) with live status, then record the
+    # reply. A reply that is waiting for approval records nothing yet: the card shows on the next run.
+    with st.chat_message('assistant', avatar=CHAT_AVATARS['assistant']):
+        with st.status('Thinking...', expanded=False) as s:
+            def on_event(kind, data):
+                if kind == 'tool_call':
+                    s.update(label=f"Calling `{data['name']}`...")
+                    if data['name'] == 'plan_beam':
+                        s.update(label='Running TRIM to confirm. The TRIM window opens on this computer and closes '
+                                       'by itself; this usually takes 2-15 minutes.', expanded=True)
+                elif kind == 'tool_result':
+                    s.write(_chat_tool_line(data))
+                elif kind == 'progress':
+                    s.write(f"{data['stage'].capitalize()} {data['step']}/{data['total']}: {data['message']}")
+                elif kind == 'rewrite':
+                    s.write('Checking the numbers against the tool results...')
+                elif kind == 'approval':
+                    s.update(label='Waiting for your approval to run TRIM', state='complete')
+            try:
+                reply = step(on_event)
+                if reply.pending:
+                    st.rerun()
+                s.update(label='Done', state='complete', expanded=False)
+                answer = {'role': 'assistant', 'text': reply.text, 'tool_calls': reply.tool_calls,
+                          'unverified': reply.unverified}
+                for call in reply.tool_calls:   # TRIM runs from the chat join the session's run history
+                    res = (call.get('raw') or {}).get('result')
+                    for r in getattr(res, 'runs', None) or []:
+                        run_p = core._load_pickle(os.path.join(core.CACHE_DIR, f"{r['cache_key']}.pkl"))
+                        if run_p is not None:
+                            remember(run_p)
+            except Exception as e:
+                s.update(label='Failed', state='error')
+                if '429' in str(e) or 'rate_limit' in str(e):   # Groq's free tier: tokens per minute and per day
+                    wait = re.search(r'try again in ([\dhms.]+)', str(e))
+                    text = ("Groq's usage limit for this model is reached"
+                            + (f'; try again in about {wait.group(1).split(".")[0]}s' if wait else '')
+                            + '. To keep going now, set GROQ_MODEL to another Groq model and restart the app.')
+                else:
+                    text = f'Sorry, the request failed: {e}'
+                answer = {'role': 'assistant', 'text': text}
+    st.session_state.chat_log.append(answer)
+    st.rerun()
+
+
+def _approval_card(pending, agent):
+    # The TRIM run the assistant wants, for a person to approve. Returns True (run), False (skip) or None.
+    a = pending['args']
+    target = a.get('material') or ', '.join(f'{k} {v:g}' for k, v in (a.get('composition') or {}).items())
+    beam = a.get('facility') or f"{a.get('e_min_MeV')}-{a.get('e_max_MeV')} MeV"
+    extras = [f'{label} {a[k]:g} nm' for k, label in (('min_depth_nm', 'ROI from'), ('min_width_nm', 'width ≥'))
+              if a.get(k) is not None]
+    # The latest prediction for this ion and target, from this turn or an earlier one
+    earlier = [c for turn in st.session_state.chat_log for c in turn.get('tool_calls') or []]
+    predicted = next((c['result']['prediction'] for c in reversed(earlier + agent._turn['calls'])
+                      if c['name'] == 'screen_beam' and (c['result'] or {}).get('prediction')
+                      and (c['args'] or {}).get('ion') == a.get('ion')
+                      and (c['args'] or {}).get('material') == a.get('material')), None)
+    with st.container(border=True):
+        st.markdown('**:material/science: Run TRIM to confirm?**')
+        st.markdown(f"**{a.get('ion')} → {target}**, {a.get('target_dpa')} dpa, {beam}"
+                    + (f" ({', '.join(extras)})" if extras else ''))
+        if predicted:
+            st.caption(f"The prediction to check: {predicted['energy_MeV']:g} MeV, {predicted['fluence']:.3g} ions/cm².")
+        st.caption('Usually one TRIM run of 1,000 ions, about 2-15 minutes; a repeat of an earlier run is instant. '
+                   'The TRIM window opens on this computer and closes by itself.')
+        if not can_run:
+            st.warning('TRIM is not set up: enter the SRIM folder in the sidebar (» at the top left), or skip.')
+        b1, b2, _ = st.columns([1, 1, 4])
+        if b1.button('Run TRIM', type='primary', icon=':material/play_arrow:', disabled=not can_run,
+                     key='chat_approve'):
+            return True
+        if b2.button('Not now', key='chat_decline'):
+            return False
+    return None
+
+
 with tab_chat:
     try:
         import srim_agent
@@ -647,46 +726,23 @@ with tab_chat:
         for n, turn in enumerate(st.session_state.chat_log):
             _show_chat_turn(turn, n)
 
+        pending = chat_agent.pending
         question = None
         if not st.session_state.chat_log:
             picked = st.pills('Try an example', list(CHAT_EXAMPLES), key='chat_example')
             question = CHAT_EXAMPLES.get(picked)
-        question = st.chat_input('e.g. 2 dpa in Fe-9Cr with Fe ions at Helsinki, ROI from 300 nm') or question
-
-        if question:
+        if pending:
+            approved = _approval_card(pending, chat_agent)
+            if approved is not None:
+                _run_chat_step(lambda on_event: chat_agent.resume(approved, on_event))
+        question = st.chat_input('Approve or skip the TRIM run above first' if pending else
+                                 'e.g. 2 dpa in Fe-9Cr with Fe ions at Helsinki, ROI from 300 nm',
+                                 disabled=bool(pending)) or question
+        if question and not pending:
             user_turn = {'role': 'user', 'text': question}
             st.session_state.chat_log.append(user_turn)
             _show_chat_turn(user_turn, len(st.session_state.chat_log) - 1)
-            with st.chat_message('assistant', avatar=CHAT_AVATARS['assistant']):
-                with st.status('Thinking...', expanded=False) as s:
-                    def on_event(kind, data):
-                        if kind == 'tool_call':
-                            s.update(label=f"Calling `{data['name']}`...")
-                            if data['name'] == 'plan_beam':
-                                s.update(label='Running TRIM to confirm (a few minutes; TRIM windows open and '
-                                               'close by themselves)...', expanded=True)
-                        elif kind == 'tool_result':
-                            s.write(_chat_tool_line(data))
-                        elif kind == 'progress':
-                            s.write(f"{data['stage'].capitalize()} {data['step']}/{data['total']}: {data['message']}")
-                        elif kind == 'rewrite':
-                            s.write('Checking the numbers against the tool results...')
-                    try:
-                        reply = chat_agent.ask(question, on_event)
-                        s.update(label='Done', state='complete', expanded=False)
-                        answer = {'role': 'assistant', 'text': reply.text, 'tool_calls': reply.tool_calls,
-                                  'unverified': reply.unverified}
-                        for call in reply.tool_calls:   # TRIM runs from the chat join the session's run history
-                            res = (call.get('raw') or {}).get('result')
-                            for r in getattr(res, 'runs', None) or []:
-                                run_p = core._load_pickle(os.path.join(core.CACHE_DIR, f"{r['cache_key']}.pkl"))
-                                if run_p is not None:
-                                    remember(run_p)
-                    except Exception as e:
-                        s.update(label='Failed', state='error')
-                        answer = {'role': 'assistant', 'text': f'Sorry, the request failed: {e}'}
-            st.session_state.chat_log.append(answer)
-            st.rerun()
+            _run_chat_step(lambda on_event: chat_agent.ask(question, on_event))
 
 # --- Single run --------------------------------------------------------------
 with tab_single:

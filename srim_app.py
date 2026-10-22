@@ -427,9 +427,9 @@ can_run = not problems and not srim_error
 # Tabs
 # ---------------------------------------------------------------------------
 
-tab_guide, tab_single, tab_energy, tab_roi, tab_one, tab_opt, tab_compare, tab_conv = st.tabs(
-    ['Start here', 'Single run', 'Energy sweep', 'Fluence & ROI', 'Optimise (one-click)', 'Optimise (manual grid)',
-     'Compare runs', 'Convergence'])
+tab_guide, tab_chat, tab_single, tab_energy, tab_roi, tab_one, tab_opt, tab_compare, tab_conv = st.tabs(
+    ['Start here', 'Ask (AI)', 'Single run', 'Energy sweep', 'Fluence & ROI', 'Optimise (one-click)',
+     'Optimise (manual grid)', 'Compare runs', 'Convergence'])
 
 with tab_guide:
     st.markdown(r"""
@@ -440,6 +440,8 @@ It runs **SRIM** for an ion beam hitting your material and turns the output into
 corrected Quick Kinchin-Pease method of Stoller et al. (2013, erratum 2019).
 
 ### Typical workflow
+0. **Ask (AI):** describe the experiment in plain English and get the beam energy, fluence and beam time.
+   Every number comes from the tools below; predictions and TRIM-confirmed results are labelled as such.
 1. **Sidebar:** choose the ion, the material (start from a preset and edit the table) and the target thickness.
 2. **Single run:** pick a beam energy and fluence, press *Run*. A TRIM window opens and closes by itself.
 3. **Convergence:** check that your number of ions is large enough (results should change by less than a few %).
@@ -463,6 +465,100 @@ Every run is remembered for this session and saved to disk, so repeating an iden
 | **Implanted ions (appm)** | Concentration of the beam ions that stopped in the sample, in atomic parts per million. |
 | **ROI** | Region of interest: a depth band with roughly uniform dpa, used for TEM or nano-indentation. |
 """)
+
+# --- Ask (AI) ----------------------------------------------------------------
+# A chat agent (srim_agent.py, on Groq) that calls the same optimiser functions as the tabs below. It does
+# not use the sidebar's ion and material: the user names them in the question.
+CHAT_EXAMPLES = [
+    'I need 3 dpa in CuCrZr with Cu ions at the HZDR 3 MV Tandetron. What energy and fluence, and how long at '
+    '50 nA on 1 cm²?',
+    'Which facilities can deliver Fe ions above 20 MeV?',
+    '5 dpa in W with W ions on the JANNuS Japet 2 MV tandem, ROI starting at 1000 nm and at least 500 nm wide.',
+]
+
+
+def _chat_tool_line(call):
+    # One line per tool call: what was asked, and where the numbers came from
+    r = call['result']
+    status = r.get('status') or ('ok' if r.get('ok', True) else f"failed: {r.get('message', '')}")
+    return f"`{call['name']}` → {status}"
+
+
+def _show_chat_turn(turn):
+    with st.chat_message(turn['role']):
+        st.markdown(turn['text'])
+        if turn.get('tool_calls'):
+            with st.expander(f"Tool calls ({len(turn['tool_calls'])}): where these numbers come from"):
+                for call in turn['tool_calls']:
+                    st.markdown(_chat_tool_line(call))
+                    st.json({'arguments': call['args'], 'result': call['result']}, expanded=False)
+        if turn.get('unverified'):
+            st.warning(f"These numbers did not come from a tool and may be wrong: {', '.join(turn['unverified'])}")
+
+
+with tab_chat:
+    try:
+        import srim_agent
+        if st.session_state.get('chat_agent') is None:
+            st.session_state.chat_agent = srim_agent.Agent(srim_dir=srim_dir)
+            st.session_state.chat_log = []
+        chat_agent = st.session_state.chat_agent
+        chat_agent.srim_dir = srim_dir
+    except Exception as e:   # groq not installed, or no API key
+        chat_agent = None
+        st.warning(f'The AI assistant is not available: {e}')
+
+    if chat_agent is not None:
+        c1, c2 = st.columns([4, 1])
+        c1.markdown('Describe the irradiation you need in plain English. The assistant answers with the same '
+                    'optimiser as the other tabs: **predicted** numbers come from the surrogate model in about a '
+                    'second, **confirmed** ones from a TRIM run (minutes; ask for it). Every number it quotes is '
+                    'checked against the tool results.')
+        c1.caption(f'Model: {chat_agent.model} on Groq.' + ('' if can_run else ' TRIM is not set up (see the '
+                   'sidebar), so only predictions are available.'))
+        if c2.button('New conversation', key='chat_reset'):
+            st.session_state.chat_agent = None
+            st.rerun()
+
+        for turn in st.session_state.chat_log:
+            _show_chat_turn(turn)
+
+        question = None
+        if not st.session_state.chat_log:
+            st.markdown('**Try:**')
+            for i, example in enumerate(CHAT_EXAMPLES):
+                if st.button(example, key=f'chat_example_{i}'):
+                    question = example
+        question = st.chat_input('e.g. 2 dpa in Fe-9Cr with Fe ions at Helsinki, ROI from 300 nm') or question
+
+        if question:
+            user_turn = {'role': 'user', 'text': question}
+            st.session_state.chat_log.append(user_turn)
+            _show_chat_turn(user_turn)
+            with st.chat_message('assistant'):
+                with st.status('Thinking...', expanded=False) as s:
+                    def on_event(kind, data):
+                        if kind == 'tool_call':
+                            s.update(label=f"Calling `{data['name']}`...")
+                            if data['name'] == 'plan_beam':
+                                s.update(label='Running TRIM to confirm (a few minutes; TRIM windows open and '
+                                               'close by themselves)...', expanded=True)
+                        elif kind == 'tool_result':
+                            s.write(_chat_tool_line(data))
+                        elif kind == 'progress':
+                            s.write(f"{data['stage'].capitalize()} {data['step']}/{data['total']}: {data['message']}")
+                        elif kind == 'rewrite':
+                            s.write('Checking the numbers against the tool results...')
+                    try:
+                        reply = chat_agent.ask(question, on_event)
+                        s.update(label='Done', state='complete', expanded=False)
+                        answer = {'role': 'assistant', 'text': reply.text, 'tool_calls': reply.tool_calls,
+                                  'unverified': reply.unverified}
+                    except Exception as e:
+                        s.update(label='Failed', state='error')
+                        answer = {'role': 'assistant', 'text': f'Sorry, the request failed: {e}'}
+            st.session_state.chat_log.append(answer)
+            st.rerun()
 
 # --- Single run --------------------------------------------------------------
 with tab_single:

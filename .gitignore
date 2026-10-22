@@ -3,6 +3,10 @@ __pycache__/
 .venv*/
 srim_output_csv/
 
+# API keys live in user environment variables; never commit a .env
+.env
+.env.*
+
 # Outputs: the app's run history and logs stay local; the dataset, the trained surrogate, SR range tables,
 # figures and benchmark results are shared, so the next person can use or retrain without 4 h of TRIM
 srim_outputs/*

@@ -1,6 +1,8 @@
+import copy
 import json
 import math
 
+import numpy as np
 import pytest
 
 import srim_dataset as dataset
@@ -83,6 +85,25 @@ def test_facility_window_and_charge_state():
     assert hi == 35.0                                    # published cap
 
 
+def test_light_ions_run_with_more_ions():
+    spec = opt.BeamSpec(target_dpa=1.0)
+    h = opt._with_ion_floors(spec, 'H')
+    assert (h.ions_search, h.ions_confirm) == opt.LIGHT_MIN_IONS['H']
+    assert opt._with_ion_floors(spec, 'Cu') == spec                       # heavy ions: as asked
+    more = opt._with_ion_floors(opt.BeamSpec(target_dpa=1.0, ions_confirm=50000), 'He')
+    assert more.ions_confirm == 50000 and more.ions_search == opt.LIGHT_MIN_IONS['He'][0]
+
+
+def test_noisy_confirmation_is_flagged(synthetic_profile):
+    # The fixture is smooth; with 40 % bin-to-bin noise, the ROI's mean dpa is uncertain by about 40 % / sqrt(28)
+    p = synthetic_profile
+    r = {'roi_start_nm': 500.0, 'roi_end_nm': 1200.0, 'roi_width_nm': 700.0}
+    assert not any('TRIM noise' in f for f in opt._flags(p, r, 5.0, 1.0, 10.0, None, 'width'))
+    noisy = copy.copy(p)
+    noisy.disp_density = p.disp_density * (1 + 0.4 * np.random.default_rng(0).standard_normal(len(p.depth_nm)))
+    assert any('TRIM noise' in f and '1 sigma' in f for f in opt._flags(noisy, r, 5.0, 1.0, 10.0, None, 'width'))
+
+
 def test_beam_time():
     t = opt.beam_time(1e15, current_nA=100, charge_state=3, area_cm2=1.0, roi_mean_dpa=3.0)
     assert abs(t['seconds'] - 1e15 * 3 * opt.E_CHARGE / 100e-9) < 1e-6
@@ -107,11 +128,27 @@ def test_plan_result_is_json_safe():
 def test_dataset_plan_is_deterministic_and_complete():
     jobs = dataset.plan_jobs()
     assert jobs == dataset.plan_jobs()
-    assert len({(j[1], j[2]) for j in jobs}) == 123
+    assert len({dataset.job_id(j) for j in jobs}) == len(jobs)
+    v1 = [j for j in jobs if j[0] in ('train', 'bench')]
+    assert len({(j[1], j[2]) for j in v1}) == 123          # Part 1's set, unchanged
     assert sum(j[0] == 'train' for j in jobs) == 1230
-    assert all(0.5e6 <= j[3] <= 50e6 for j in jobs)
+    assert all(0.5e6 <= j[3] <= 50e6 for j in jobs if j[1] not in dataset.LIGHT_IONS)
+    for ion, (lo, hi) in dataset.LIGHT_RANGES_MEV.items():
+        assert all(lo * 1e6 <= j[3] <= hi * 1e6 for j in jobs if j[1] == ion)
+    assert sum(j[0] == 'alloy' for j in jobs) == len(dataset.ALLOYS) * 9 * 3 + 2 * 3   # + self-ions V and Zr
+    assert sum(j[0] == 'light' for j in jobs) == 25 * 2 * dataset.LIGHT_ENERGIES
+    kinds = [j[0] for j in jobs]
+    assert kinds[:kinds.count('test')] == ['test'] * kinds.count('test')   # the test set runs first
+    assert dataset.cache_dir_for('test') != dataset.cache_dir_for('alloy')
 
 
-@pytest.mark.parametrize('target', dataset.TARGETS)
+def test_part1_runs_stay_done():
+    # The v1 job ids are what progress.csv marks done; a change to them would run Part 1 again
+    progress = dataset.read_progress()
+    done = set(progress.loc[progress['ok'] == True, 'job_id'])   # noqa: E712
+    assert {dataset.job_id(j) for j in dataset.v1_jobs()} <= done
+
+
+@pytest.mark.parametrize('target', dataset.TARGETS + dataset.ALLOYS)
 def test_every_target_has_its_self_ion(target):
     assert dataset.SELF_ION.get(target, target) in dataset.ions_for(target)

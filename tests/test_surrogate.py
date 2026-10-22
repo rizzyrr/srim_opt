@@ -12,6 +12,24 @@ def test_shape_on_u_preserves_area():
     assert abs(total - np.sum(density) * 19.98) / total < 1e-3
 
 
+def test_refine_keeps_area_and_shape():
+    u = (sur.U_EDGES[:-1] + sur.U_EDGES[1:]) / 2
+    s = np.exp(-0.5 * ((u - 0.8) / 0.2) ** 2)
+    fine = sur._refine(s)
+    assert abs(np.sum(fine) * sur.DU_OUT - np.sum(s) * sur.DU) < 1e-12
+    uf = (sur.OUT_EDGES[:-1] + sur.OUT_EDGES[1:]) / 2
+    assert np.max(np.abs(fine - np.exp(-0.5 * ((uf - 0.8) / 0.2) ** 2))) < 0.01
+
+
+def test_lindhard_eta_matches_nrt_for_self_ions():
+    # Cu -> Cu at 10 MeV: k = 0.1337 Z^(1/6) (Z/A)^(1/2) and eps = E / E_L as in the NRT standard
+    Z, A, E = 29.0, 63.546, 1e7
+    k = 0.1337 * Z ** (1 / 6) * (Z / A) ** 0.5
+    eps = E / (30.724 * Z * Z * np.sqrt(2 * Z ** (2 / 3)) * 2)
+    nrt = 1 / (1 + k * (3.4008 * eps ** (1 / 6) + 0.40244 * eps ** 0.75 + eps))
+    assert abs(sur.lindhard_eta(Z, A, Z, A, E) / nrt - 1) < 0.005
+
+
 def test_reduced_energy_scales_with_energy():
     eps = sur.reduced_energy(29, 63.5, 29, 63.5, [1e6, 2e6])
     assert abs(eps[1] / eps[0] - 2.0) < 1e-12
@@ -55,8 +73,9 @@ def test_predicted_profile_works_with_roi_options(tmp_path):
     E = np.geomspace(1e4, 6e7, 60)
     table = core.RangeTable('Cu', E, E * 0, E * 0, 1e-3 * E ** 0.8, 3e-4 * E ** 0.8)
     p = model.predict_profiles(m, 'Cu', [5e6], table=table)[0]
-    assert p.meta['surrogate'] and len(p.depth_nm) == 80
-    assert abs(np.sum(p.implanted) * sur.DU * p.meta['Rp_nm'] * 1e-7 - 1.0) < 0.05   # ~all ions stop
+    assert p.meta['surrogate'] and len(p.depth_nm) == len(sur.OUT_EDGES) - 1
+    assert abs(np.sum(p.implanted) * p.bin_nm * 1e-7 - 1.0) < 0.05   # ~all ions stop
+    assert abs(p.Tdam_eV - np.sum(p.Tdam_density) * p.bin_nm * 10) / p.Tdam_eV < 1e-9
     r = core.roi_options(p, 1.0, 0.05, 0.1 * p.meta['Rp_nm'], 0.1 * p.meta['Rp_nm'], 0.0, 'width', None)
     assert r is not None and r['fluence'] > 0
     samples = model.predict_profiles(m, 'Cu', [5e6], table=table, n_samples=5)

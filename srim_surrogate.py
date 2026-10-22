@@ -6,6 +6,7 @@
 #   E_d        NRT dpa = 0.8 T_dam / (2 E_d)          -> the model predicts damage energy, not dpa
 #   depth      SR gives the projected range Rp(E)     -> profiles live on u = depth / Rp
 #   magnitude  totals are split from shapes           -> damage-energy fraction and stopped fraction
+#   partition  Lindhard-Robinson (the NRT formula)    -> the model learns TRIM's damage energy relative to it
 # The shapes left on the u grid are compressed with PCA, and a Gaussian process learns the PCA weights
 # and the two totals from four physics inputs: ZBL reduced energy, mass ratio M1/M2, Z1 and Z2.
 #
@@ -31,6 +32,8 @@ MODEL_DIR = os.path.join(core.OUTPUT_DIR, 'surrogate')
 MODEL_PATH = os.path.join(MODEL_DIR, 'surrogate.npz')
 U_EDGES = np.linspace(0.0, 2.0, 81)          # depth / projected range
 DU = float(U_EDGES[1] - U_EDGES[0])
+OUT_EDGES = np.linspace(0.0, 2.0, 161)       # predicted profiles come out on a finer grid, so an ROI edge at
+DU_OUT = float(OUT_EDGES[1] - OUT_EDGES[0])  # high energy is not rounded to whole 1/40-of-Rp bins
 MIN_IONS = 300
 HOLDOUT_GROUPS = {'Cu + CuCrZr': ['Cu', 'CuCrZr'], 'W': ['W'], 'SiC': ['SiC']}
 GROUPS = ('totals', 'damage', 'implant')   # one Gaussian process each
@@ -60,6 +63,22 @@ def features(material: core.Material, ion_symbol: str, energies_eV) -> np.ndarra
     return np.column_stack([np.log10(eps), np.full(n, np.log10(M1 / M2)), np.full(n, Z1), np.full(n, Z2)])
 
 
+def lindhard_eta(Z1: float, M1: float, Z2: float, M2: float, energy_eV) -> np.ndarray:
+    # Damage-energy fraction T_dam / E from the Lindhard partition with Robinson's fit (as in the NRT
+    # formula), applied to the ion itself. TRIM's value differs from it by a smooth factor of order one.
+    z23 = Z1 ** (2 / 3) + Z2 ** (2 / 3)
+    E_L = 30.724 * Z1 * Z2 * math.sqrt(z23) * (M1 + M2) / M2           # eV
+    k = 0.0793 * Z1 ** (2 / 3) * Z2 ** 0.5 * (M1 + M2) ** 1.5 / (z23 ** 0.75 * M1 ** 1.5 * M2 ** 0.5)
+    eps = np.asarray(energy_eV, dtype=float) / E_L
+    return 1.0 / (1.0 + k * (3.4008 * eps ** (1 / 6) + 0.40244 * eps ** 0.75 + eps))
+
+
+def log_eta_baseline(material: core.Material, ion_symbol: str, energies_eV) -> np.ndarray:
+    ion = core.element_data(ion_symbol)
+    Z2, M2 = target_ZM(material)
+    return np.log(lindhard_eta(float(ion['z']), float(ion['mass']), Z2, M2, np.atleast_1d(energies_eV)))
+
+
 # ---------------------------------------------------------------------------
 # Training data: TRIM profiles -> totals and shapes on the u grid
 # ---------------------------------------------------------------------------
@@ -74,6 +93,14 @@ def shape_on_u(depth_hi_nm: np.ndarray, density: np.ndarray, Rp_nm: float) -> Tu
     if total <= 0:
         return np.zeros(len(U_EDGES) - 1), 0.0
     return np.diff(np.interp(U_EDGES * Rp_nm, edges, cum)) / total / DU, total
+
+
+def _refine(shape: np.ndarray) -> np.ndarray:
+    # A shape on the U_EDGES bins, linearly interpolated onto the OUT_EDGES bins with its area kept
+    centres = lambda e: (e[:-1] + e[1:]) / 2      # noqa: E731
+    fine = np.interp(centres(OUT_EDGES), centres(U_EDGES), shape)
+    area = float(np.sum(fine)) * DU_OUT
+    return fine * (float(np.sum(shape)) * DU / area) if area > 0 else fine
 
 
 @dataclass
@@ -135,10 +162,33 @@ def _kernel():
             + WhiteKernel(1e-3, (1e-8, 1.0)))
 
 
-def _gp(kernel, optimise: bool):
+def _gp(kernel, optimise: bool, restarts: int = 0):
     from sklearn.gaussian_process import GaussianProcessRegressor
     return GaussianProcessRegressor(kernel=kernel, normalize_y=True, optimizer='fmin_l_bfgs_b' if optimise else None,
-                                    n_restarts_optimizer=0, random_state=0)
+                                    n_restarts_optimizer=restarts, random_state=0)
+
+
+class _PerOutputGP:
+    # One Gaussian process per output, so each PCA weight gets its own length scales and noise level (the
+    # minor components are mostly TRIM noise; with a shared kernel their noise would smooth the main ones)
+
+    def __init__(self, gps: list):
+        self.gps = gps
+
+    @classmethod
+    def fit(cls, xs: np.ndarray, Y: np.ndarray, thetas: np.ndarray) -> '_PerOutputGP':
+        return cls([_gp(_kernel().clone_with_theta(th), False).fit(xs, Y[:, j]) for j, th in enumerate(thetas)])
+
+    def predict(self, xs: np.ndarray) -> Tuple[np.ndarray, np.ndarray]:
+        # Mean and spread of the underlying profile: the fitted white noise is the Monte-Carlo scatter between
+        # TRIM runs, not uncertainty about the profile, so it is taken out of the predictive spread
+        means, stds = [], []
+        for gp in self.gps:
+            m, s = gp.predict(xs, return_std=True)
+            noise = gp.kernel_.k2.noise_level * float(np.squeeze(getattr(gp, '_y_train_std', 1.0))) ** 2
+            means.append(m)
+            stds.append(np.sqrt(np.clip(s ** 2 - noise, 0, None)))
+        return np.column_stack(means), np.column_stack(stds)
 
 
 def _n_components(sv: np.ndarray, cap: int, keep: float = 0.995) -> int:
@@ -147,16 +197,24 @@ def _n_components(sv: np.ndarray, cap: int, keep: float = 0.995) -> int:
 
 
 class Surrogate:
-    # PCA of the profile shapes + one Gaussian process per output group, on standardised physics inputs
+    # PCA of the profile shapes + one Gaussian process per output, on standardised physics inputs
 
     def __init__(self, arrays: Dict[str, np.ndarray], info: dict, gps: Optional[dict] = None):
         self.a, self.info = arrays, info
-        self.gps = gps or {g: _gp(_kernel().clone_with_theta(arrays[f'theta_{g}']), False)
-                           .fit(self._xs(arrays['X']), arrays[f'Y_{g}']) for g in GROUPS}
+        if gps is None:
+            gps = {}
+            for g in GROUPS:
+                Y, thetas = arrays[f'Y_{g}'], np.atleast_2d(arrays[f'theta_{g}'])
+                if len(thetas) == 1:    # a model saved with one kernel shared by the outputs
+                    thetas = np.repeat(thetas, Y.shape[1], axis=0)
+                gps[g] = _PerOutputGP.fit(self._xs(arrays['X']), Y, thetas)
+        self.gps = gps
 
     # --- training --------------------------------------------------------
     @classmethod
-    def fit(cls, ts: TrainingSet, max_hyper_points: int = 1500, verbose: bool = False) -> 'Surrogate':
+    def fit(cls, ts: TrainingSet, max_hyper_points: int = 500, verbose: bool = False,
+            eta_baseline: bool = True, restarts: int = 0) -> 'Surrogate':
+        # eta_baseline=False learns log(T_dam / E) directly instead of relative to Lindhard-Robinson (ablation)
         started = time.time()
         a = {'X': ts.X, 'x_mean': ts.X.mean(0), 'x_std': ts.X.std(0) + 1e-12}
         for key, M, cap in (('damage', ts.S, 8), ('implant', ts.G, 6)):
@@ -165,26 +223,33 @@ class Surrogate:
             k = _n_components(sv, cap)
             a[f'{key}_mean'], a[f'{key}_comp'] = mean, vt[:k]
             a[f'{key}_var'] = np.array(float(np.sum(sv[:k] ** 2) / np.sum(sv ** 2)))
-        a['Y_totals'] = np.column_stack([ts.log_eta, ts.stopped])
+        base = (np.array([log_eta_baseline(core.MATERIALS[t], i, E)[0]
+                          for t, i, E in zip(ts.targets, ts.ions, ts.energy_eV)])
+                if eta_baseline else np.zeros(len(ts)))
+        a['Y_totals'] = np.column_stack([ts.log_eta - base, ts.stopped])
         a['Y_damage'] = (ts.S - a['damage_mean']) @ a['damage_comp'].T
         a['Y_implant'] = (ts.G - a['implant_mean']) @ a['implant_comp'].T
         xs = (ts.X - a['x_mean']) / a['x_std']
         rng = np.random.default_rng(0)
+        idx = rng.choice(len(xs), min(len(xs), max_hyper_points), replace=False)   # hyperparameters on a subset
         gps = {}
         for g in GROUPS:
             Y = a[f'Y_{g}']
-            idx = rng.choice(len(xs), min(len(xs), max_hyper_points), replace=False)
-            with warnings.catch_warnings():   # hyperparameters at a bound are fine here (e.g. an input that barely matters)
-                warnings.simplefilter('ignore')
-                tuned = _gp(_kernel(), True).fit(xs[idx], Y[idx])    # hyperparameters on a subset
-            a[f'theta_{g}'] = tuned.kernel_.theta
-            gps[g] = _gp(tuned.kernel_, False).fit(xs, Y) if len(idx) < len(xs) else tuned
+            thetas = []
+            for j in range(Y.shape[1]):
+                with warnings.catch_warnings():   # hyperparameters at a bound are fine (an input that barely matters)
+                    warnings.simplefilter('ignore')
+                    thetas.append(_gp(_kernel(), True, restarts).fit(xs[idx], Y[idx, j]).kernel_.theta)
+            a[f'theta_{g}'] = np.array(thetas)
+            gps[g] = _PerOutputGP.fit(xs, Y, a[f'theta_{g}'])
             a[f'y_std_{g}'] = Y.std(0) + 1e-12
             if verbose:
-                print(f'  {g:7}: {Y.shape[1]} outputs, kernel {tuned.kernel_}', flush=True)
+                noise = [f'{gp.kernel_.k2.noise_level:.2g}' for gp in gps[g].gps]
+                print(f'  {g:7}: {Y.shape[1]} outputs, noise share {", ".join(noise)}', flush=True)
         info = {'n_runs': len(ts), 'targets': sorted(set(ts.targets.tolist())), 'ions': sorted(set(ts.ions.tolist())),
                 'energy_MeV': [float(ts.energy_eV.min() / 1e6), float(ts.energy_eV.max() / 1e6)],
                 'x_min': ts.X.min(0).tolist(), 'x_max': ts.X.max(0).tolist(),
+                'eta_baseline': 'lindhard-robinson' if eta_baseline else None,
                 'components': {'damage': int(len(a['damage_comp'])), 'implant': int(len(a['implant_comp']))},
                 'variance_kept': {'damage': float(a['damage_var']), 'implant': float(a['implant_var'])},
                 'fit_seconds': round(time.time() - started, 1), 'trained': time.strftime('%Y-%m-%d %H:%M')}
@@ -220,8 +285,7 @@ class Surrogate:
     def predict_outputs(self, X: np.ndarray) -> Tuple[Dict[str, np.ndarray], Dict[str, np.ndarray]]:
         means, stds = {}, {}
         for g in GROUPS:
-            m, s = self.gps[g].predict(self._xs(X), return_std=True)
-            means[g], stds[g] = m.reshape(len(X), -1), s.reshape(len(X), -1)
+            means[g], stds[g] = self.gps[g].predict(self._xs(X))
         return means, stds
 
     def uncertainty(self, stds: Dict[str, np.ndarray]) -> np.ndarray:
@@ -241,6 +305,8 @@ class Surrogate:
         X = features(material, ion_symbol, energies_eV)
         means, stds = self.predict_outputs(X)
         unc, inside = self.uncertainty(stds), self.in_domain(X)
+        base = (log_eta_baseline(material, ion_symbol, energies_eV) if self.info.get('eta_baseline')
+                else np.zeros(len(energies_eV)))
         rng = np.random.default_rng(seed)
         profiles = []
         for i, E in enumerate(energies_eV):
@@ -248,20 +314,21 @@ class Surrogate:
                 {g: rng.normal(means[g][i], stds[g][i]) for g in GROUPS} for _ in range(n_samples)]
             Rp, _ = table.at(E)
             for d in draws:
-                profiles.append(self._profile(material, ion_symbol, E, Rp, d, float(unc[i]), bool(inside[i])))
+                profiles.append(self._profile(material, ion_symbol, E, Rp, d, float(base[i]), float(unc[i]),
+                                              bool(inside[i])))
         return profiles
 
-    def _profile(self, material, ion_symbol, energy_eV, Rp_nm, out, unc, inside) -> core.DamageProfile:
-        s = np.clip(self.a['damage_mean'] + out['damage'] @ self.a['damage_comp'], 0, None)
-        g = np.clip(self.a['implant_mean'] + out['implant'] @ self.a['implant_comp'], 0, None)
-        T_total = math.exp(out['totals'][0]) * energy_eV
+    def _profile(self, material, ion_symbol, energy_eV, Rp_nm, out, log_eta_base, unc, inside) -> core.DamageProfile:
+        s = _refine(np.clip(self.a['damage_mean'] + out['damage'] @ self.a['damage_comp'], 0, None))
+        g = _refine(np.clip(self.a['implant_mean'] + out['implant'] @ self.a['implant_comp'], 0, None))
+        T_total = math.exp(out['totals'][0] + log_eta_base) * energy_eV
         stopped = float(np.clip(out['totals'][1], 0, 1))
         Tdam_density = T_total * s / (Rp_nm * 10)          # eV / A / ion (s has unit area over u)
         implanted = stopped * g / (Rp_nm * 1e-7)           # 1/cm per ion
-        T_in_grid = float(np.sum(Tdam_density) * DU * Rp_nm * 10)
+        T_in_grid = float(np.sum(Tdam_density) * DU_OUT * Rp_nm * 10)
         return core.DamageProfile(
             material=material, ion_symbol=ion_symbol, energy_eV=float(energy_eV), number_ions=0,
-            depth_nm=U_EDGES[1:] * Rp_nm, Tdam_density=Tdam_density,
+            depth_nm=OUT_EDGES[1:] * Rp_nm, Tdam_density=Tdam_density,
             disp_density=0.8 * Tdam_density / (2 * material.nrt_Ed), implanted=implanted,
             Tdam_eV=T_in_grid, N_NRT=0.8 * T_in_grid / (2 * material.nrt_Ed), Tdam_balance_eV=T_in_grid,
             meta={'surrogate': True, 'uncertainty': unc, 'in_domain': inside, 'Rp_nm': Rp_nm})
@@ -323,9 +390,11 @@ def summarise(rows: List[dict]) -> str:
     def pct(key, q):
         v = np.abs([r[key] for r in rows if np.isfinite(r[key])])
         return f'{np.percentile(v, q) * 100:5.1f}%' if v.size else '   --'
+    with_window = sum(np.isfinite(r['fluence_error']) for r in rows)
     return (f'fluence error median {pct("fluence_error", 50)}, p90 {pct("fluence_error", 90)} | '
             f'ROI width error median {pct("width_error", 50)}, p90 {pct("width_error", 90)} | '
-            f'shape error median {pct("shape_error", 50)} | n = {len(rows)}')
+            f'damage energy error median {pct("damage_energy_error", 50)} | '
+            f'shape error median {pct("shape_error", 50)} | n = {len(rows)} ({with_window} with a TRIM window)')
 
 
 def split_pairs(runs, test_fraction: float = 0.15, seed: int = 1):
@@ -338,6 +407,12 @@ def split_pairs(runs, test_fraction: float = 0.15, seed: int = 1):
     return train, held
 
 
+def band_quantile(rows: List[dict], q: float = 80) -> Optional[float]:
+    # Split-conformal band: the q-th percentile of |log(true / predicted fluence)| on held-out pairs
+    v = np.abs(np.log1p([r['fluence_error'] for r in rows if np.isfinite(r['fluence_error'])]))
+    return float(np.percentile(v, q)) if v.size >= 5 else None
+
+
 def cmd_fit() -> None:
     runs = load_runs()
     print(f'{len(runs)} training runs on {len({r[0] for r in runs})} targets.')
@@ -347,11 +422,17 @@ def cmd_fit() -> None:
     train, held = split_pairs(runs)
     t = time.time()
     model = Surrogate.fit(build_training_set(train))
+    rows = evaluate_on(model, held)
     print(f'Held-out ion-target pairs ({len(held)} runs, model on {len(train)} runs, '
           f'{model.info["components"]} PCA components, fit {time.time() - t:.0f} s):')
-    print('  ' + summarise(evaluate_on(model, held)))
+    print('  ' + summarise(rows))
     final = Surrogate.fit(build_training_set(runs))
+    q = band_quantile(rows)
+    final.info['fluence_log_q80'] = q
     final.save()
+    if q:
+        print(f'80 % of held-out fluences were within x{math.exp(q):.2f} of the prediction: '
+              f'the optimiser\'s fluence band is at least this wide.')
     print(f'Saved the model trained on all {len(runs)} runs to {MODEL_PATH}')
 
 

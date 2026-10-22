@@ -46,6 +46,7 @@ class Oracle:
         self.energies = np.array(sorted(refs))
         self.points: Dict[float, tuple] = {}
         self.bill: Dict[float, int] = {}   # energy -> most ions paid for there
+        self.path = ''                     # how the strategy chose (for the surrogate: used, or fell back)
 
     def snap(self, E: float) -> float:
         return float(self.energies[np.argmin(np.abs(np.log(self.energies / E)))])
@@ -95,12 +96,19 @@ def search_strategy(o: Oracle, e_lo: float, e_hi: float) -> Optional[float]:
 def surrogate_strategy(o: Oracle, model: sur.Surrogate, material: core.Material, ion: str,
                        e_lo: float, e_hi: float) -> Optional[float]:
     # One-click with the surrogate: choose among the reference energies from predictions alone, confirm once,
-    # and search around the proposal with TRIM only if the confirmation finds no valid ROI
+    # and search around the proposal with TRIM only if the confirmation finds no valid ROI. Like plan(), it
+    # searches with TRIM instead when the surrogate sees no valid ROI or is unsure.
     window = [E for E in o.energies if e_lo * 0.999 <= E <= e_hi * 1.001]
     preds = model.predict_profiles(material, ion, np.array(window) * 1e6)
     E = opt.pick_best([(E, opt.evaluate(p, o.spec)) for E, p in zip(window, preds)], o.spec)
     if E is None:
+        o.path = 'search (surrogate sees no valid ROI)'
         return search_strategy(o, e_lo, e_hi)
+    p = preds[window.index(E)]
+    if not p.meta['in_domain'] or p.meta['uncertainty'] > opt.MAX_UNCERTAINTY:
+        o.path = f'search (surrogate unsure: {p.meta["uncertainty"]:.2f})'
+        return search_strategy(o, e_lo, e_hi)
+    o.path = 'surrogate'
     _, r = o.run(E, 1000, 'confirm')
     if r is None:
         E2 = opt._search(o, max(e_lo, E / 1.5), min(e_hi, E * 1.5))
@@ -148,7 +156,8 @@ def benchmark() -> pd.DataFrame:
             regret = (None if val is None or best_val is None else
                       (best_val - val) / best_val if spec.objective == 'width' else (val - best_val) / best_val)
             rows.append({'case': f'{ion} -> {target}', 'objective': spec.objective, 'strategy': label,
-                         'trim_runs': n_runs, 'ion_histories': histories, 'trim_minutes': round(minutes, 1),
+                         'path': o.path, 'trim_runs': n_runs, 'ion_histories': histories,
+                         'trim_minutes': round(minutes, 1),
                          'chosen_MeV': chosen, 'best_MeV': best_true, 'objective_value': val,
                          'best_value': best_val, 'shortfall_vs_best': regret})
     return pd.DataFrame(rows)
@@ -158,7 +167,7 @@ def confirm_cases() -> pd.DataFrame:
     rows = []
     for ion, target, spec in CASES:
         print(f'plan(): {ion} -> {target} ...', flush=True)
-        r = opt.plan(target, ion, spec)
+        r = opt.plan(target, ion, spec, minimised=True)
         pred = r.prediction or {}
         rows.append({'case': f'{ion} -> {target}', 'ok': r.ok, 'energy_MeV': r.energy_MeV, 'fluence': r.fluence,
                      'roi_nm': f'{r.roi_start_nm:.0f}-{r.roi_end_nm:.0f}' if r.ok else '',
@@ -177,8 +186,8 @@ def main(argv=None) -> None:
     if len(df):
         df.to_csv(os.path.join(OUT_DIR, 'benchmark.csv'), index=False)
         with pd.option_context('display.width', 200, 'display.max_columns', 20, 'display.max_colwidth', 45):
-            print(df[['case', 'strategy', 'trim_runs', 'ion_histories', 'trim_minutes', 'chosen_MeV', 'best_MeV',
-                      'shortfall_vs_best']].to_string(index=False))
+            print(df[['case', 'strategy', 'path', 'trim_runs', 'ion_histories', 'trim_minutes', 'chosen_MeV',
+                      'best_MeV', 'shortfall_vs_best']].to_string(index=False))
         summary = df.groupby('strategy')[['trim_runs', 'ion_histories', 'trim_minutes']].sum()
         print('\nTotals over the cases:\n' + summary.to_string())
     if args.confirm:

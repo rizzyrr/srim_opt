@@ -320,9 +320,9 @@ def _infeasible_message(table: core.RangeTable, spec: BeamSpec, ion: str, mat_na
 
 class _Runs:
     # The TRIM runs of one plan: timing, a time model, and a record of every evaluation
-    def __init__(self, material, ion, spec, srim_dir, cache_dir, table, progress):
+    def __init__(self, material, ion, spec, srim_dir, cache_dir, table, progress, minimised=False):
         self.material, self.ion, self.spec = material, ion, spec
-        self.srim_dir, self.cache_dir, self.table = srim_dir, cache_dir, table
+        self.srim_dir, self.cache_dir, self.table, self.minimised = srim_dir, cache_dir, table, minimised
         self.progress = progress or (lambda *a: None)
         self.started = time.time()
         self.runs: List[dict] = []
@@ -343,7 +343,8 @@ class _Runs:
         E_MeV = float(f'{E_MeV:.3g}')
         self.progress(stage, len(self.runs) + 1, 0, f'TRIM {self.ion} {E_MeV:g} MeV, {n} ions')
         estimate = self.estimate_s(E_MeV, n)
-        p = core.run_sized(self.material, self.ion, E_MeV * 1e6, n, self.srim_dir, self.cache_dir, self.table)
+        p = core.run_sized(self.material, self.ion, E_MeV * 1e6, n, self.srim_dir, self.cache_dir, self.table,
+                           minimised=self.minimised)
         r = evaluate(p, self.spec)
         if not p.meta.get('from_cache'):
             self._ratios.append(p.meta.get('wall_s', estimate) / estimate)
@@ -437,12 +438,13 @@ def _flags(p: core.DamageProfile, r: dict, E: float, e_lo: float, e_hi: float,
 
 def plan(material: Union[str, core.Material], ion: str, spec: BeamSpec,
          srim_dir: str = core.DEFAULT_SRIM_DIR, cache_dir: str = core.CACHE_DIR,
-         progress: Optional[ProgressFn] = None, surrogate=None) -> PlanResult:
+         progress: Optional[ProgressFn] = None, surrogate=None, minimised: bool = False) -> PlanResult:
     """One-click optimiser: best energy and fluence for the spec, confirmed with a >= 1000-ion TRIM run.
 
     `material` is a Material or a MATERIALS name. `progress(stage, step, total, message)` is called before
     every TRIM run. If a trained surrogate is available (passed in, or saved by srim_surrogate.py) its
     proposal is confirmed directly; otherwise the energy is searched with 300-ion runs.
+    `minimised=True` runs TRIM in a minimised, low-priority window (for background use).
     """
     m, name = _resolve_material(material)
     result = PlanResult(ok=False, message='', material=name, ion=ion, spec=asdict(spec))
@@ -462,7 +464,7 @@ def plan(material: Union[str, core.Material], ion: str, spec: BeamSpec,
 
     lo_E = max(e_lo, e_feas)
     n_confirm = max(spec.ions_confirm, spec.ions_search)
-    runs = _Runs(m, ion, spec, srim_dir, cache_dir, table, progress)
+    runs = _Runs(m, ion, spec, srim_dir, cache_dir, table, progress, minimised)
     proposal = _surrogate_proposal(surrogate, m, name, ion, spec, lo_E, e_hi)
     if proposal is not None:
         E_best, result.curve = proposal['energy_MeV'], proposal['curve']
@@ -577,6 +579,13 @@ def _surrogate_proposal(surrogate, material, name, ion, spec, e_lo, e_hi, n_ener
     ok = [r for r in redone if r is not None]
     band = {'fluence': [float(v) for v in np.percentile(fluences, [10, 90])],
             'feasible_fraction': len(ok) / len(redone)}
+    q = model.info.get('fluence_log_q80')
+    if q:
+        # The model's own spread is too narrow: widen it to what held-out ion-target pairs showed (80 % of
+        # them were inside this factor of the prediction)
+        f = r_best['fluence']
+        band['fluence'] = [min(band['fluence'][0], f * math.exp(-q)), max(band['fluence'][1], f * math.exp(q))]
+        band['calibrated_on_heldout_pairs'] = True
     if ok:
         band['roi_width_nm'] = [float(v) for v in np.percentile([r['roi_width_nm'] for r in ok], [10, 90])]
     curve = [{'energy_MeV': float(E), 'objective': objective_value(r, spec.objective), 'feasible': r is not None,

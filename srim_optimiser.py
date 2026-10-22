@@ -1,5 +1,5 @@
 # One-click beam optimiser: the ion energy and fluence that give a target mean dpa over a region of
-# interest (ROI), with as few TRIM runs as possible. OPTIMISER_PROBLEM.md describes the problem.
+# interest (ROI), with as few TRIM runs as possible.
 #
 # dpa(x) = fluence * k(x; E), so for any energy and depth window the fluence is exact; only the energy
 # needs TRIM runs. Without a surrogate the search is: a feasibility bracket from SR ranges, a short log

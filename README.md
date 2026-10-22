@@ -180,8 +180,8 @@ writes the answer from the tools' results. All physics runs locally in this repo
 - **Damage is NRT dpa** from SRIM Quick Kinchin-Pease (Stoller et al. 2013), with ASTM E521
   displacement energies.
 
-[OPTIMISER_PROBLEM.md](OPTIMISER_PROBLEM.md) defines the problem in full, and
-[PART2_HANDOFF.md](PART2_HANDOFF.md) documents the Python API.
+The Python API (`screen()`, `plan()`, `beam_time()` and the facility functions) is listed at the top of
+[srim_optimiser.py](srim_optimiser.py).
 
 ### How a beam is chosen
 

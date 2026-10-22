@@ -1,5 +1,17 @@
 __pycache__/
 .pytest_cache/
 .venv*/
-srim_outputs/
 srim_output_csv/
+
+# Outputs: the app's run history and logs stay local; the dataset, the trained surrogate, SR range tables,
+# figures and benchmark results are shared, so the next person can use or retrain without 4 h of TRIM
+srim_outputs/*
+!srim_outputs/surrogate/
+!srim_outputs/sr_cache/
+!srim_outputs/dataset/
+!srim_outputs/dataset_cache/
+!srim_outputs/figures/
+!srim_outputs/benchmark/
+srim_outputs/**/*.log
+srim_outputs/**/*.tmp
+srim_outputs/surrogate/validation_leave_materials_out.csv

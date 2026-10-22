@@ -22,6 +22,9 @@ st.markdown("""
 <style>
 [data-testid="stMetricValue"] { font-size: 1.4rem; }
 [data-testid="stMetricValue"] > div, [data-testid="stMetricDelta"] > div { white-space: normal; overflow: visible; }
+/* Periodic table: compact buttons so 18 columns fit the dialog */
+div[role="dialog"] [data-testid="stHorizontalBlock"] { gap: 0.2rem; }
+div[role="dialog"] .stButton button { padding: 0.15rem 0; min-height: 2rem; font-size: 0.8rem; }
 </style>
 """, unsafe_allow_html=True)
 
@@ -39,6 +42,54 @@ PRESETS = {
 }
 
 SYMBOLS = core.all_element_symbols()
+
+
+def _table_cell(z):
+    """(row, column) of element z in the standard periodic table; rows 8-9 hold the lanthanides and actinides."""
+    if z <= 2:
+        return 1, 1 if z == 1 else 18
+    for start, row in ((3, 2), (11, 3)):
+        if start <= z < start + 8:
+            return row, z - start + 1 if z < start + 2 else z - start + 11
+    if z <= 54:
+        return (4, z - 18) if z <= 36 else (5, z - 36)
+    for alkali, row, f_row in ((55, 6, 8), (87, 7, 9)):
+        if z < alkali + 32:
+            if z < alkali + 2:
+                return row, z - alkali + 1
+            if z < alkali + 17:
+                return f_row, z - alkali + 1        # La-Lu / Ac-Lr in their own row, columns 3-17
+            return row, z - alkali - 13
+    return None
+
+
+TABLE = {_table_cell(int(core.element_data(s)['z'])): s for s in SYMBOLS}
+
+
+@st.dialog('Choose an element', width='large')
+def element_dialog(purpose):
+    # purpose 'ion': pick the beam ion; 'add': add an element to the target composition
+    chosen = ({st.session_state.ion_symbol} if purpose == 'ion'
+              else set(st.session_state.comp_current[1]['Element'].astype(str)))
+    st.caption('Click an element.' + (' Highlighted: already in the target.' if purpose == 'add' else ''))
+    for row in range(1, 10):
+        if row == 8:
+            st.caption('Lanthanides and actinides')
+        cols = st.columns(18, gap='small')
+        for col in range(1, 19):
+            sym = TABLE.get((row, col))
+            if sym:
+                cols[col - 1].button(sym, key=f'pt_{purpose}_{sym}', width='stretch',
+                                     type='primary' if sym in chosen else 'secondary',
+                                     help=str(core.element_data(sym).get('name', sym)),
+                                     on_click=_pick_element, args=(purpose, sym))
+    if f'pending_{purpose}' in st.session_state:
+        st.rerun()          # a full rerun closes the dialog and applies the choice
+
+
+def _pick_element(purpose, sym):
+    # Button callback: runs before the next script run even when the dialog is not drawn again
+    st.session_state[f'pending_{purpose}'] = sym
 
 # Composition table: entered in atomic % or weight %, always converted to atomic % for TRIM.
 UNIT_COLS = {'at': 'Atomic %', 'wt': 'Weight %'}
@@ -254,8 +305,12 @@ with st.sidebar:
         st.success('TRIM.exe found', icon='✅')
 
     st.subheader('2. Ion beam')
-    ion = st.selectbox('Incident ion', SYMBOLS, index=SYMBOLS.index('Cu'),
-                       help='Self-ion irradiation uses the same element as the main target element.')
+    if 'pending_ion' in st.session_state:          # picked in the periodic table on the last run
+        st.session_state.ion_symbol = st.session_state.pop('pending_ion')
+    ion = st.session_state.setdefault('ion_symbol', 'Cu')
+    if st.button(f'Incident ion: **{ion}** (change)', width='stretch',
+                 help='Opens the periodic table. Self-ion irradiation uses the main target element.'):
+        element_dialog('ion')
     n_ions = st.number_input('Number of ions', min_value=10, max_value=100000, value=1000, step=100,
                              help='More ions = smoother profiles but longer runs. 1,000 is a good start; '
                                   'check with the Convergence tab.')
@@ -266,6 +321,15 @@ with st.sidebar:
                     format_func=lambda u: UNIT_COLS[u], on_change=_on_unit_change,
                     help='Switching converts the values already in the table.')
     value_col = UNIT_COLS[unit]
+    if 'pending_add' in st.session_state:          # element picked in the periodic table on the last run
+        sym = st.session_state.pop('pending_add')
+        old_unit, cur = st.session_state.comp_current
+        if sym in set(cur['Element'].astype(str)):
+            st.toast(f'{sym} is already in the target.')
+        else:
+            _seed_table(cur['Element'].astype(str).tolist() + [sym],
+                        cur[UNIT_COLS[old_unit]].tolist() + [0.0],
+                        cur['E_d (eV)'].tolist() + [float(core.E_D_ASTM.get(sym, 25.0))], old_unit)
     comp_df = st.data_editor(
         st.session_state.comp_seed, key=f'composition_{st.session_state.comp_ver}', num_rows='dynamic',
         hide_index=True,
@@ -277,6 +341,11 @@ with st.sidebar:
                                                       help='Displacement threshold energy of this element.'),
         })
     comp_df = comp_df.dropna()
+    st.session_state.comp_current = (unit, comp_df)
+    if st.button('Add element from the periodic table', width='stretch',
+                 help='Adds a row with 0 % and the ASTM E521 displacement energy (25 eV if none); then type '
+                      'its amount in the table.'):
+        element_dialog('add')
 
     # Balance element: its amount is whatever the other rows leave out of 100%
     balance_options = ['None'] + list(dict.fromkeys(comp_df['Element'].astype(str)))

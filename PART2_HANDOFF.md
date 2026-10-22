@@ -4,13 +4,36 @@ Part 1 left the physics core as a Python API in `srim_optimiser.py`. The app's *
 already uses it. The LLM interface should call the same functions as tools and quote only the numbers they
 return.
 
+## What Part 1 delivered (branch `riz`)
+
+| Piece | File | Result |
+|---|---|---|
+| Dataset: 1,350 TRIM runs, 15 heavy ions into 13 nuclear materials, 0.5-50 MeV | `srim_dataset.py`, `srim_outputs/dataset/` | 0 failures; Parquet file and datasheet |
+| Surrogate: Gaussian process on range-scaled profiles | `srim_surrogate.py`, `srim_outputs/surrogate/` | fluence error 2.8 % median on unseen ion-target pairs; 0.3 s for 60 energies |
+| One-click optimiser: surrogate proposes, one TRIM run confirms | `srim_optimiser.py` | 5 TRIM runs instead of 33 over five benchmark cases; all five real plans in 1-3 min each |
+| Accelerator presets: energy window, charge state, terminal voltage | `srim_optimiser.FACILITIES` | 11 machines |
+| App | `srim_app.py` | **Optimise (one-click)** tab; periodic-table element picker |
+| Benchmark and figures | `bench_optimiser.py`, `make_figures.py`, `srim_outputs/figures/` | five PNGs for the write-up |
+
+The repo includes the trained model, the dataset (raw runs in `srim_outputs/dataset_cache/`, enough to
+retrain), the SR range tables and the figures, so nothing needs re-running. The same dataset and model are
+on Hugging Face as private repos under `bizzyrizzy`; ask Riz for access.
+
 ## Setup
 
-- Windows only: TRIM runs through SRIM-2013. SRIM lives in `C:\Users\Riz\Documents\SRIM`; set `SRIM_DIR`
-  to use another copy.
-- Use `.venv313` (Python 3.13). The Anthropic and MCP SDKs need Python 3.10 or newer; the old `.venv` is 3.9.
-  `pip install -r requirements.txt anthropic mcp`
-- `pytest tests` (no TRIM needed) should pass before and after your changes.
+1. `git clone https://github.com/rizzyrr/srim_opt.git`, then `git checkout riz`.
+2. Python 3.13: `py -3.13 -m venv .venv313`, then `.venv313\Scripts\pip install -r requirements.txt anthropic mcp`.
+   The Anthropic and MCP SDKs need Python 3.10 or newer.
+3. `.venv313\Scripts\python -m pytest tests`: 40 tests, no SRIM needed. They should pass before and after your changes.
+4. Try it without SRIM: `screen()` works for the ion-target pairs in the dataset (the 13 named materials
+   with C, Si, Fe, Ni, Cu, Kr, Xe, W, Au or the self-ion), because their SR range tables are in the repo.
+   Any other pair needs SRIM installed.
+5. `plan()` and the app need SRIM-2013 (Windows, from srim.org). By default the code looks in
+   `C:\Users\Riz\Documents\SRIM`; set the `SRIM_DIR` environment variable to point elsewhere.
+6. The app: `run_srim_gui.bat`.
+
+To retrain the surrogate after new TRIM runs: `python srim_surrogate.py fit` (about 2 min).
+`validate`, `learning-curve` and `few-shot` reproduce the accuracy numbers.
 
 ## The calls
 

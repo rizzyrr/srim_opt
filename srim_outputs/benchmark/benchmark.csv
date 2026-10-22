@@ -1,0 +1,16 @@
+case,objective,strategy,path,trim_runs,ion_histories,trim_minutes,chosen_MeV,best_MeV,objective_value,best_value,shortfall_vs_best
+Cu -> CuCrZr,width,grid: 6+2 runs at 1000 ions (app today),,6,6000,19.5,8.45,8.45,425.0000000000001,425.0000000000001,0.0
+Cu -> CuCrZr,width,search: 300-ion runs + 1 confirmation,,5,2200,7.3,8.45,8.45,425.0000000000001,425.0000000000001,0.0
+Cu -> CuCrZr,width,"surrogate: predicted, then 1 confirmation",surrogate,1,1000,3.7,8.45,8.45,425.0000000000001,425.0000000000001,0.0
+Fe -> Fe-9Cr,width,grid: 6+2 runs at 1000 ions (app today),,6,6000,27.0,17.2,17.2,357.00000000000006,357.00000000000006,0.0
+Fe -> Fe-9Cr,width,search: 300-ion runs + 1 confirmation,,5,2200,7.4,17.2,17.2,357.00000000000006,357.00000000000006,0.0
+Fe -> Fe-9Cr,width,"surrogate: predicted, then 1 confirmation",surrogate,1,1000,3.8,17.2,17.2,357.00000000000006,357.00000000000006,0.0
+W -> W,width,grid: 6+2 runs at 1000 ions (app today),,7,7000,23.8,35.0,35.0,545.0,545.0,0.0
+W -> W,width,search: 300-ion runs + 1 confirmation,,5,2200,9.0,35.0,35.0,545.0,545.0,0.0
+W -> W,width,"surrogate: predicted, then 1 confirmation",surrogate,1,1000,5.4,35.0,35.0,545.0,545.0,0.0
+Ni -> Ni,fluence,grid: 6+2 runs at 1000 ions (app today),,8,8000,27.0,8.45,8.45,5339887659180937.0,5339887659180937.0,0.0
+Ni -> Ni,fluence,search: 300-ion runs + 1 confirmation,,5,2200,9.3,17.2,8.45,5810538652690775.0,5339887659180937.0,0.08813874439860954
+Ni -> Ni,fluence,"surrogate: predicted, then 1 confirmation",surrogate,1,1000,3.2,4.15,8.45,5597608312078604.0,5339887659180937.0,0.048263309894650046
+Si -> SiC,width,grid: 6+2 runs at 1000 ions (app today),,6,6000,11.9,24.6,24.6,1322.999,1322.999,0.0
+Si -> SiC,width,search: 300-ion runs + 1 confirmation,,5,2200,5.4,24.6,24.6,1322.999,1322.999,0.0
+Si -> SiC,width,"surrogate: predicted, then 1 confirmation",surrogate,1,1000,2.7,24.6,24.6,1322.999,1322.999,0.0

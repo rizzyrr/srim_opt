@@ -38,8 +38,15 @@ PRESETS = {
     'Pure Cu': [('Cu', 100.0, 25.0)],
     'Pure Fe': [('Fe', 100.0, 40.0)],
     'Pure W': [('W', 100.0, 90.0)],
-    'Custom (start empty)': [('Cu', 100.0, 25.0)],
 }
+# The fusion, fission and high-entropy alloys of the surrogate's training set (srim_core.MATERIALS): atomic %, their
+# displacement energies, and a literature density that the preset enters as the measured density
+PRESET_DENSITY = {}
+for _name, _m in core.MATERIALS.items():
+    if _name not in core.V1_MATERIALS:
+        PRESETS[_name] = [(c.symbol, round(float(x * 100), 6), c.E_d) for c, x in zip(_m.constituents, _m.fractions)]
+        PRESET_DENSITY[_name] = _m.density_override
+PRESETS['Custom (start empty)'] = [('Cu', 100.0, 25.0)]
 
 SYMBOLS = core.all_element_symbols()
 
@@ -111,6 +118,10 @@ def _on_preset_change():
     values = at if st.session_state.comp_unit == 'at' else core.convert_composition(symbols, at, to='wt')
     _seed_table(list(symbols), np.round(values, 4), list(e_d), st.session_state.comp_unit)
     st.session_state.comp_balance = symbols[0]   # presets list the base metal first
+    density = PRESET_DENSITY.get(st.session_state.preset)
+    st.session_state.density_mode = 'Enter measured value' if density else 'Estimate from composition'
+    if density:
+        st.session_state.density_value = float(density)
 
 
 def _on_unit_change():
@@ -280,7 +291,7 @@ def quality_checks(p):
             f'profile is coarse. Reduce **Target thickness** in the sidebar to about '
             f'{max(100, round(2 * auto_xmax([p]) / 100) * 100):,.0f} nm and run again.')
     diff = abs(p.Tdam_eV - p.Tdam_balance_eV) / p.Tdam_balance_eV * 100
-    if diff > 5:
+    if core.energy_balance_off(p):
         st.warning(f'Damage energy from PHONON.txt and from the energy balance differ by {diff:.1f}%. '
                    'Check that the target is thick enough to stop the ions and that the run used enough ions.')
     if p.number_ions < 1000:
@@ -374,10 +385,14 @@ with st.sidebar:
                     'V/Cr/Mn/Fe/Co/Ni/Zr/Nb 40, Mo 60, Ta/W 90. ')
 
     st.subheader('4. Target geometry')
-    density_mode = st.radio('Density', ['Estimate from composition', 'Enter measured value'], horizontal=True)
+    density_mode = st.radio('Density', ['Estimate from composition', 'Enter measured value'], horizontal=True,
+                            key='density_mode', help='The alloy presets enter a literature density. The estimate '
+                                                     'assumes ideal mixing and fails for N or O, which pysrim lists '
+                                                     'as gases.')
     density_override = None
     if density_mode == 'Enter measured value':
-        density_override = st.number_input('Density (g/cm³)', min_value=0.01, value=8.94, format='%.3f')
+        st.session_state.setdefault('density_value', 8.94)   # a preset may have set it already
+        density_override = st.number_input('Density (g/cm³)', min_value=0.01, format='%.3f', key='density_value')
     thickness_nm = st.number_input('Target thickness (nm)', min_value=10.0, value=5000.0, step=500.0,
                                    help='TRIM splits the target into 100 depth bins. Make it roughly 2x the '
                                         'ion range so the profile is well resolved.')
@@ -766,6 +781,7 @@ with tab_one:
     oc_width = c4.number_input('Minimum ROI width (nm)', min_value=1.0, value=100.0, key='oc_width')
     c1, c2, c3, c4 = st.columns(4)
     oc_obj = c1.selectbox('Optimise for', list(core.OBJECTIVES), format_func=core.OBJECTIVES.get, key='oc_obj',
+                          index=list(core.OBJECTIVES).index('width'),   # BeamSpec's default, as OPTIMISER_PROBLEM.md decided
                           help='Widest ROI: windows within 5 % of the widest count as equal, and the one needing '
                                'the lowest fluence wins.')
     oc_imode = c2.radio('Implant limit', ['distance', 'percent'], horizontal=True, key='oc_imode',
@@ -870,7 +886,7 @@ with tab_one:
                 if pred:
                     try:
                         import srim_surrogate
-                        model = srim_surrogate.load_latest()
+                        model = srim_surrogate.load_latest(res_ion)
                         p_pred = model.predict_profiles(res_material, res_ion, [res.energy_MeV * 1e6])[0]
                         curves.append({'name': 'Surrogate prediction', 'depth': p_pred.depth_nm,
                                        'dpa': p_pred.dpa(res.fluence), 'appm': p_pred.implanted_appm(res.fluence),

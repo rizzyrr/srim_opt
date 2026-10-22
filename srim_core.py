@@ -49,10 +49,11 @@ finally:
     yaml.load = _yaml_load
 
 NA = 6.02214076e23  # atoms/mol
-DEFAULT_SRIM_DIR = os.environ.get('SRIM_DIR', r'C:\Users\Riz\Documents\SRIM')
+DEFAULT_SRIM_DIR = os.environ.get('SRIM_DIR', os.path.join(os.path.expanduser('~'), 'Documents', 'SRIM'))
 OUTPUT_DIR = os.path.join(os.path.dirname(os.path.abspath(__file__)), 'srim_outputs')
 CACHE_DIR = os.path.join(OUTPUT_DIR, 'cache')                  # runs made from the app and the optimiser
 DATASET_CACHE_DIR = os.path.join(OUTPUT_DIR, 'dataset_cache')  # surrogate training runs (srim_dataset.py)
+TEST_CACHE_DIR = os.path.join(OUTPUT_DIR, 'test_cache')        # high-statistics test runs, never trained on
 SR_CACHE_DIR = os.path.join(OUTPUT_DIR, 'sr_cache')            # stopping/range tables
 
 # TRIM and SR read and write fixed files inside their SRIM folder, so only one run may use a folder at a
@@ -206,6 +207,10 @@ class Material:
 # commonly used values for SiC.
 E_D_ASTM = {'Al': 27.0, 'Ti': 30.0, 'Cu': 30.0, 'V': 40.0, 'Cr': 40.0, 'Mn': 40.0, 'Fe': 40.0, 'Co': 40.0,
             'Ni': 40.0, 'Zr': 40.0, 'Nb': 40.0, 'Mo': 60.0, 'Ta': 90.0, 'W': 90.0, 'Si': 35.0, 'C': 20.0}
+# Elements of the named alloys that ASTM E521 does not list: assumed equal to the ASTM value of the lattice
+# they sit in (Re in W; Sn and O in Zr; N in Fe; Y and O for ODS steels). plan() and screen() flag them.
+E_D_ASSUMED = {'Re': 90.0, 'Sn': 40.0, 'Y': 40.0, 'O': 40.0, 'N': 40.0}
+_E_D_NOT_ASTM = {'Si', 'C'} | set(E_D_ASSUMED)
 
 
 def named_material(composition: Dict[str, float], unit: str = 'at',
@@ -214,8 +219,27 @@ def named_material(composition: Dict[str, float], unit: str = 'at',
     symbols = list(composition)
     values = np.array([composition[s] for s in symbols], dtype=float)
     at = values if unit == 'at' else convert_composition(symbols, values, to='at')
-    return Material(tuple(Constituent(s, float(x), E_D_ASTM[s]) for s, x in zip(symbols, at)),
+    missing = [s for s in symbols if s not in E_D_ASTM and s not in E_D_ASSUMED]
+    if missing:
+        raise ValueError(f'No displacement energy known for {", ".join(missing)}: build the Material with '
+                         'Constituent(symbol, at_pct, E_d) instead.')
+    return Material(tuple(Constituent(s, float(x), E_D_ASTM.get(s, E_D_ASSUMED.get(s))) for s, x in zip(symbols, at)),
                     density_override=density)
+
+
+def assumed_Ed_note(material: Material) -> Optional[str]:
+    # A sentence naming the constituents whose displacement energy is not an ASTM E521 value, or None
+    parts = [f'{c.symbol} {c.E_d:g} eV ({x:.2g} at%)' for c, x in zip(material.constituents, material.fractions * 100)
+             if c.symbol in _E_D_NOT_ASTM and E_D_ASTM.get(c.symbol, E_D_ASSUMED.get(c.symbol)) == c.E_d]
+    if not parts:
+        return None
+    return ('Displacement energies not listed in ASTM E521 were assumed: ' + ', '.join(parts)
+            + '. Their effect on the mean E_d, and so on dpa, is small unless the element is a major constituent.')
+
+
+def _balance(base: str, rest: Dict[str, float]) -> Dict[str, float]:
+    # Composition with `base` making up 100 % minus the others
+    return {base: 100.0 - sum(rest.values()), **rest}
 
 
 # Targets of the surrogate training set; also the materials the LLM interface can name
@@ -225,6 +249,34 @@ MATERIALS: Dict[str, Material] = {
     'Fe-9Cr': named_material({'Fe': 91.0, 'Cr': 9.0}, unit='wt'),      # binary model alloy for EUROFER97
     'SiC': named_material({'Si': 50.0, 'C': 50.0}, density=3.21),
 }
+
+# Fusion, fission and high-entropy alloys added for surrogate v2: nominal (mid-specification) compositions in
+# wt % (at % for the high-entropy alloys) and room-temperature densities from the literature. Every one has its
+# density set: pysrim lists gas densities for N and O, so the ideal-mixing estimate would be wrong for them.
+MATERIALS.update({
+    # Fusion
+    'EUROFER97': named_material(_balance('Fe', {'Cr': 9.0, 'W': 1.1, 'Mn': 0.4, 'V': 0.2, 'Ta': 0.12, 'C': 0.11,
+                                                'N': 0.03}), unit='wt', density=7.75),
+    'V-4Cr-4Ti': named_material(_balance('V', {'Cr': 4.0, 'Ti': 4.0}), unit='wt', density=6.05),
+    'W-5Re': named_material(_balance('W', {'Re': 5.0}), unit='wt', density=19.4),
+    'W-5Ta': named_material(_balance('W', {'Ta': 5.0}), unit='wt', density=19.1),
+    # Fission
+    '316L': named_material(_balance('Fe', {'Cr': 17.0, 'Ni': 12.0, 'Mo': 2.5, 'Mn': 1.8, 'Si': 0.5, 'C': 0.02}),
+                           unit='wt', density=8.00),
+    'T91': named_material(_balance('Fe', {'Cr': 9.0, 'Mo': 0.95, 'Mn': 0.45, 'Si': 0.35, 'V': 0.22, 'Ni': 0.2,
+                                          'Nb': 0.08, 'C': 0.10, 'N': 0.05}), unit='wt', density=7.77),
+    'HT-9': named_material(_balance('Fe', {'Cr': 12.0, 'Mo': 1.0, 'Mn': 0.6, 'Ni': 0.5, 'W': 0.5, 'Si': 0.4,
+                                           'V': 0.3, 'C': 0.2}), unit='wt', density=7.78),
+    'Zircaloy-4': named_material(_balance('Zr', {'Sn': 1.5, 'Fe': 0.2, 'Cr': 0.1, 'O': 0.12}), unit='wt',
+                                 density=6.56),
+    'Inconel-718': named_material(_balance('Fe', {'Ni': 52.5, 'Cr': 19.0, 'Nb': 5.1, 'Mo': 3.05, 'Ti': 0.9,
+                                                  'Al': 0.5}), unit='wt', density=8.19),
+    # High-entropy alloys (equiatomic)
+    'CoCrFeNi': named_material({'Co': 25.0, 'Cr': 25.0, 'Fe': 25.0, 'Ni': 25.0}, density=8.2),
+    'CoCrFeMnNi': named_material({'Co': 20.0, 'Cr': 20.0, 'Fe': 20.0, 'Mn': 20.0, 'Ni': 20.0}, density=8.0),
+    'NiCoCr': named_material({'Ni': 100 / 3, 'Co': 100 / 3, 'Cr': 100 / 3}, density=8.3),
+})
+V1_MATERIALS = ('Fe', 'Cr', 'Ni', 'Cu', 'W', 'Mo', 'Ta', 'V', 'Ti', 'Zr', 'CuCrZr', 'Fe-9Cr', 'SiC')
 
 
 def material_name(material: Material) -> Optional[str]:
@@ -428,6 +480,85 @@ def _popen_options(minimised: bool) -> dict:
     return {'startupinfo': info, 'creationflags': subprocess.BELOW_NORMAL_PRIORITY_CLASS}
 
 
+class _HiddenProcess:
+    # A process started on the hidden desktop, with the parts of Popen that _run_trim_exe uses
+    def __init__(self, handle):
+        self.handle = handle
+
+    def wait(self, timeout: float) -> int:
+        import ctypes
+        from ctypes import wintypes
+        kernel32 = ctypes.windll.kernel32
+        if kernel32.WaitForSingleObject(wintypes.HANDLE(self.handle), int(timeout * 1000)) == 0x102:   # WAIT_TIMEOUT
+            raise subprocess.TimeoutExpired('TRIM.exe', timeout)
+        code = wintypes.DWORD()
+        kernel32.GetExitCodeProcess(wintypes.HANDLE(self.handle), ctypes.byref(code))
+        kernel32.CloseHandle(wintypes.HANDLE(self.handle))
+        return int(code.value)
+
+    def kill(self) -> None:
+        import ctypes
+        from ctypes import wintypes
+        ctypes.windll.kernel32.TerminateProcess(wintypes.HANDLE(self.handle), 1)
+        ctypes.windll.kernel32.CloseHandle(wintypes.HANDLE(self.handle))
+
+
+_hidden_desktop = None   # handle of this process's hidden desktop, kept open while it runs TRIM
+
+
+def _start_hidden(exe: str, cwd: str) -> Optional[_HiddenProcess]:
+    """Start exe minimised at below-normal priority on a Windows desktop that is never shown; None if Windows refuses.
+
+    TRIM is a Visual Basic program whose message loop goes through the Windows GUI for every ion. On the person's own
+    desktop the taskbar and any program that hooks windows (chat apps, overlays) slow it, by 1.6x for a lone run;
+    a desktop of its own has neither. Parallel runs still share one GUI lock per Windows session, which caps them at
+    about five runs' worth of speed however many cores there are.
+    """
+    global _hidden_desktop
+    if os.name != 'nt':
+        return None
+    try:
+        import ctypes
+        from ctypes import wintypes
+
+        class STARTUPINFOW(ctypes.Structure):
+            _fields_ = [('cb', wintypes.DWORD), ('lpReserved', wintypes.LPWSTR), ('lpDesktop', wintypes.LPWSTR),
+                        ('lpTitle', wintypes.LPWSTR)] + [(f, wintypes.DWORD) for f in (
+                            'dwX', 'dwY', 'dwXSize', 'dwYSize', 'dwXCountChars', 'dwYCountChars', 'dwFillAttribute',
+                            'dwFlags')] + [('wShowWindow', wintypes.WORD), ('cbReserved2', wintypes.WORD),
+                                           ('lpReserved2', ctypes.c_void_p), ('hStdInput', wintypes.HANDLE),
+                                           ('hStdOutput', wintypes.HANDLE), ('hStdError', wintypes.HANDLE)]
+
+        class PROCESS_INFORMATION(ctypes.Structure):
+            _fields_ = [('hProcess', wintypes.HANDLE), ('hThread', wintypes.HANDLE), ('dwProcessId', wintypes.DWORD),
+                        ('dwThreadId', wintypes.DWORD)]
+
+        user32, kernel32 = ctypes.WinDLL('user32'), ctypes.WinDLL('kernel32')
+        name = 'srimopt_trim'
+        if _hidden_desktop is None:
+            user32.CreateDesktopW.restype = wintypes.HANDLE
+            user32.CreateDesktopW.argtypes = [wintypes.LPCWSTR, wintypes.LPCWSTR, ctypes.c_void_p, wintypes.DWORD,
+                                              wintypes.DWORD, ctypes.c_void_p]
+            _hidden_desktop = user32.CreateDesktopW(name, None, None, 0, 0x10000000, None)   # GENERIC_ALL
+            if not _hidden_desktop:
+                _hidden_desktop = False
+        if not _hidden_desktop:
+            return None
+        si = STARTUPINFOW(cb=ctypes.sizeof(STARTUPINFOW), lpDesktop=name, dwFlags=0x1, wShowWindow=7)
+        pi = PROCESS_INFORMATION()
+        kernel32.CreateProcessW.argtypes = [wintypes.LPCWSTR, wintypes.LPWSTR, ctypes.c_void_p, ctypes.c_void_p,
+                                            wintypes.BOOL, wintypes.DWORD, ctypes.c_void_p, wintypes.LPCWSTR,
+                                            ctypes.POINTER(STARTUPINFOW), ctypes.POINTER(PROCESS_INFORMATION)]
+        if not kernel32.CreateProcessW(exe, ctypes.create_unicode_buffer(f'"{exe}"'), None, None, False,
+                                       subprocess.BELOW_NORMAL_PRIORITY_CLASS, None, cwd, ctypes.byref(si),
+                                       ctypes.byref(pi)):
+            return None
+        kernel32.CloseHandle(pi.hThread)
+        return _HiddenProcess(pi.hProcess)
+    except Exception:   # anything unexpected: start TRIM the ordinary way
+        return None
+
+
 def _run_trim_exe(trim: TRIM, srim_dir: str, timeout_s: float, minimised: bool = False) -> Results:
     # Like pysrim's TRIM.run, but with a timeout and a check that outputs are fresh
     # pysrim waits forever if TRIM hangs, and if TRIM dies early it silently parses the
@@ -438,7 +569,8 @@ def _run_trim_exe(trim: TRIM, srim_dir: str, timeout_s: float, minimised: bool =
     try:
         os.chdir(srim_dir)
         trim._write_input_files()
-        proc = subprocess.Popen([os.path.join(srim_dir, 'TRIM.exe')], **_popen_options(minimised))
+        exe = os.path.join(srim_dir, 'TRIM.exe')
+        proc = (_start_hidden(exe, srim_dir) if minimised else None) or subprocess.Popen([exe], **_popen_options(minimised))
         try:
             returncode = proc.wait(timeout=timeout_s)
         except subprocess.TimeoutExpired:
@@ -589,6 +721,26 @@ def sized_material_sr(material: Material, ion_symbol: str, energy_eV: float,
     Rp, dRp = table.at(energy_eV)
     width_nm = max(100.0, np.ceil(1.4 * (Rp + 3 * dRp) / 50.0) * 50.0)
     return replace(material, width_A=width_nm * 10)
+
+
+def energy_balance_off(p: DamageProfile) -> bool:
+    # True if the damage energy from PHONON.txt and from the energy balance (beam energy less ionisation) differ by
+    # more than 5 %. For H and He the damage energy is about 0.1 % of the beam energy, so the balance is a small
+    # difference of large numbers: the gap must also exceed 0.5 % of the beam energy to count.
+    gap = abs(p.Tdam_eV - p.Tdam_balance_eV)
+    return p.Tdam_balance_eV > 0 and gap > 0.05 * p.Tdam_balance_eV and gap > 0.005 * p.energy_eV
+
+
+def mean_dpa_noise(p: DamageProfile, lo_nm: float, hi_nm: float) -> float:
+    # Monte Carlo noise (1 sigma, relative) of a TRIM run's mean dpa over [lo_nm, hi_nm], from the bin-to-bin scatter
+    # about its smoothed profile; nan for too few bins. H and He are the noisy cases: rare high-energy recoils carry
+    # most of their damage energy, so even 10,000 ions leave a few per cent over a 25-bin window.
+    k = p.dpa(1.0)
+    sm = smooth(k)
+    inside = (p.depth_nm >= lo_nm) & (p.depth_nm <= hi_nm) & (sm > 0)
+    if inside.sum() < 3:
+        return float('nan')
+    return float(np.std((k[inside] - sm[inside]) / sm[inside]) / np.sqrt(inside.sum()))
 
 
 def target_too_thin(p: DamageProfile) -> bool:

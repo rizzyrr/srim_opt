@@ -5,8 +5,12 @@
 #   overlay.png          (fits its own model with every Cu and CuCrZr run left out)
 #   few_shot.png         python srim_surrogate.py few-shot
 #   benchmark.png        python bench_optimiser.py
+#   test_parity.png      python srim_surrogate.py evaluate-test --family heavy --model
+#                        srim_outputs/surrogate/v1/surrogate.npz --label v1, then the same for v2 (--label v2)
+#   width_error.png      (the same two)
+#   light_overlay.png    (fits its own light-ion model with the test runs' ion-target pairs left out)
 #
-#   python make_figures.py [learning_curve parity overlay few_shot benchmark]
+#   python make_figures.py [learning_curve parity overlay few_shot benchmark test_parity width_error light_overlay]
 
 import os
 import sys
@@ -130,7 +134,7 @@ def overlay(group: str = 'Cu + CuCrZr', ion: str = 'Cu', target: str = 'CuCrZr',
         print(f'overlay.png: no {ion} -> {target} runs yet')
         return
     print(f'overlay.png: training a surrogate without any {group} runs...', flush=True)
-    model = sur.Surrogate.fit(sur.build_training_set([r for r in runs if r[0] not in names]))
+    model = sur.fit_family([r for r in runs if r[0] not in names], 'heavy')
     fig, ax = plt.subplots(figsize=(6.6, 3.9))
     x_max = 0.0
     for k, p in enumerate(_pick(cands, energies_MeV)):
@@ -210,8 +214,139 @@ def benchmark() -> None:
     _save(fig, 'benchmark.png')
 
 
+TEST_SCORES = {'v1': os.path.join(sur.MODEL_DIR, 'test_scores_v1.csv'),
+               'v2': os.path.join(sur.MODEL_DIR, 'test_scores_v2.csv')}
+TEST_GROUPS = {'v1 targets': 'Part 1 targets (pairs in training, other energies)',
+               'v2 alloys': 'v2 alloys (v1 never saw them; v2 trained on them)'}
+
+
+def _test_scores():
+    if not all(os.path.exists(p) for p in TEST_SCORES.values()):
+        return None
+    return {k: pd.read_csv(p) for k, p in TEST_SCORES.items()}
+
+
+def test_parity() -> None:
+    # v1 and v2 against the high-statistics test runs, run by run: the error of the predicted fluence (over TRIM's
+    # own ROI, where it has one) and of the 0.2-0.6 Rp dose (every run), with the truth's own noise shaded. Each run's
+    # two predictions are joined, so a shorter orange end is an improvement. Errors are on a linear % axis: on a
+    # log-log parity plot they are too small to see.
+    scores = _test_scores()
+    if scores is None:
+        print('test_parity.png: run "python srim_surrogate.py evaluate-test" for v1 and v2 first (see the top)')
+        return
+    lim = 8.0   # % ; runs beyond it are drawn as triangles at the edge, with their values written beside them
+    metrics = [('fluence_error', 'Fluence over TRIM\'s ROI'), ('fixed_window_error', 'Dose over 0.2-0.6 Rp')]
+    columns = {'v1 targets': 'Part 1 targets: pairs in training, other energies',
+               'v2 alloys': 'v2 alloys: v1 never saw them, v2 trained on them'}
+    fig, axes = plt.subplots(2, 2, figsize=(9.6, 6.8), sharex=True, sharey=True)
+    keys = ['target', 'ion', 'energy_MeV']
+    both = scores['v1'].merge(scores['v2'], on=keys + ['group', 'truth_noise_fixed'], suffixes=('_v1', '_v2'))
+    for i, (metric, row_title) in enumerate(metrics):
+        for j, (group, title) in enumerate(columns.items()):
+            ax = axes[i, j]
+            g = both[(both.group == group) & both[f'{metric}_v1'].notna()].sort_values('energy_MeV')
+            noise = 100 * np.median(g.truth_noise_fixed)
+            ax.axhspan(-noise, noise, color=GRID, alpha=0.8, lw=0, zorder=0)
+            ax.axhline(0, color=MUTED, lw=0.8, zorder=1)
+            for _, r in g.iterrows():
+                ends = [np.clip(100 * r[f'{metric}_{m}'], -lim, lim) for m in ('v1', 'v2')]
+                ax.plot([r.energy_MeV] * 2, ends, color=MUTED, lw=0.8, alpha=0.6, zorder=2)
+            for k, m in enumerate(('v1', 'v2')):
+                v = 100 * g[f'{metric}_{m}']
+                inside = v.abs() <= lim
+                ax.scatter(g.energy_MeV[inside], v[inside], s=26, marker=MARKERS[k], color=COLORS[k],
+                           edgecolor='white', linewidth=0.6, zorder=3 + k,
+                           label=f'{m}: median |error| {np.median(np.abs(v)):.1f} %, p90 {np.percentile(np.abs(v), 90):.1f} %')
+                out = v[~inside]
+                ax.scatter(g.energy_MeV[~inside] * (0.95 if k == 0 else 1.05), np.sign(out) * lim, s=34,
+                           marker=['^' if x > 0 else 'v' for x in out][0] if len(out) else '^', color=COLORS[k],
+                           edgecolor='white', linewidth=0.6, zorder=5)
+            for _, r in g[(100 * g[[f'{metric}_v1', f'{metric}_v2']].abs() > lim).any(axis=1)].iterrows():
+                a, b = 100 * r[f'{metric}_v1'], 100 * r[f'{metric}_v2']
+                ax.annotate(f'{r.ion} into {r.target}: v1 {a:+.0f} %, v2 {b:+.0f} %', (r.energy_MeV, np.sign(a) * lim),
+                            xytext=(-8, -12 * np.sign(a) - 2), textcoords='offset points', ha='right', fontsize=7.5,
+                            color=MUTED)
+            ax.set_xscale('log')
+            ax.set_ylim(-lim * 1.1, lim * 1.1)
+            ax.legend(loc='lower left', fontsize=7.5, handletextpad=0.3)
+            if i == 0:
+                ax.set_title(f'{title} ({len(both[both.group == group])} runs)', fontsize=9, loc='left')
+            if i == 1:
+                ax.set_xlabel('Beam energy (MeV)')
+                ax.xaxis.set_major_formatter(ScalarFormatter())
+            if j == 0:
+                ax.set_ylabel(f'{row_title}\npredicted / TRIM - 1 (%)')
+    fig.suptitle('Against high-statistics TRIM runs (5,000 ions; 3,000 for the alloys). Grey band: the truth\'s own '
+                 'noise (median 1 sigma). Fluence only where TRIM\'s profile has a flat ROI.', fontsize=9, x=0.01,
+                 ha='left')
+    fig.tight_layout()
+    _save(fig, 'test_parity.png')
+
+
+def width_error() -> None:
+    # ROI width under +-10 % flatness: |predicted - TRIM| / TRIM against high-statistics truth, as cumulative curves
+    scores = _test_scores()
+    if scores is None:
+        print('width_error.png: run "python srim_surrogate.py evaluate-test" for v1 and v2 first (see the top)')
+        return
+    fig, ax = plt.subplots(figsize=(5.6, 3.8))
+    names = {'v1 targets': 'Part 1 targets', 'v2 alloys': 'alloys'}
+    for k, (label, df) in enumerate(scores.items()):
+        for j, group in enumerate(TEST_GROUPS):
+            v = np.sort(100 * np.abs(df.loc[(df.group == group) & df.width_error.notna(), 'width_error']))
+            if not v.size:
+                continue
+            ax.step(v, np.arange(1, v.size + 1) / v.size, where='post', color=COLORS[k], lw=2 if j == 0 else 1.3,
+                    ls='-' if j == 0 else '--', label=f'{label}, {names[group]}: median {np.median(v):.0f} % (n = {v.size})')
+    ax.set_xlim(0, 60)
+    ax.set_ylim(0, 1.02)
+    ax.set_xlabel('ROI width error, ±10 % flatness (%)')
+    ax.set_ylabel('Share of test runs')
+    ax.set_title('Against high-statistics TRIM runs. A curve that stops below 1: runs where\nthe model predicts no '
+                 'flat window at all (100 % error, off the axis).', fontsize=8.5, loc='left')
+    ax.legend(fontsize=8, loc='lower right')
+    _save(fig, 'width_error.png')
+
+
+def light_overlay() -> None:
+    # H and He: TRIM's high-count profiles against a light-ion model that never saw the ion-target pair
+    test = sur.load_test_runs('light')
+    if not test:
+        print('light_overlay.png: no H or He test runs yet (python srim_dataset.py run)')
+        return
+    runs = sur.load_runs(family='light')
+    pairs = {(n, p.ion_symbol) for n, p, _ in test}
+    print(f'light_overlay.png: training a light-ion model without the {len(pairs)} test pairs...', flush=True)
+    model = sur.fit_family([r for r in runs if (r[0], r[1].ion_symbol) not in pairs], 'light')
+    want = [('Fe-9Cr', 'H'), ('W', 'H'), ('W', 'He'), ('EUROFER97', 'He')]
+    picked = [max((r for r in test if (r[0], r[1].ion_symbol) == w), key=lambda r: r[1].energy_eV, default=None)
+              for w in want]
+    picked = [r for r in picked if r is not None]
+    # The GP's own posterior band is far too narrow (it held 0-10 % of the test runs), so none is drawn
+    fig, axes = plt.subplots(1, len(picked), figsize=(3.0 * len(picked), 3.4))
+    for ax, (name, p, _) in zip(np.atleast_1d(axes), picked):
+        mean = model.predict_profiles(p.material, p.ion_symbol, [p.energy_eV])[0]
+        ax.plot(p.depth_nm / 1e3, p.dpa(1e17), color=INK, lw=1.0)
+        ax.plot(mean.depth_nm / 1e3, mean.dpa(1e17), color=COLORS[0], lw=1.8, ls='--')
+        ax.set_xlim(0, 1.25 * mean.meta['Rp_nm'] / 1e3)
+        ax.set_ylim(bottom=0)
+        ax.set_title(f'{p.ion_symbol} → {name}, {p.energy_eV / 1e6:.3g} MeV ({p.number_ions:,} ions)', fontsize=8.5,
+                     loc='left')
+        ax.set_xlabel('Depth (µm)')
+    np.atleast_1d(axes)[0].set_ylabel('dpa at 10¹⁷ ions/cm²')
+    fig.legend(handles=[Line2D([], [], color=INK, lw=1.0, label='TRIM (test run, never trained on)'),
+                        Line2D([], [], color=COLORS[0], lw=1.8, ls='--', label='light-ion surrogate (mean)')],
+               loc='lower center', ncol=2, fontsize=8.5, bbox_to_anchor=(0.5, -0.02))
+    fig.suptitle('H and He: the light-ion surrogate, trained without these ion-target pairs, against TRIM', fontsize=9.5,
+                 x=0.01, ha='left')
+    fig.tight_layout(rect=(0, 0.07, 1, 1))
+    _save(fig, 'light_overlay.png')
+
+
 FIGURES = {'learning_curve': learning_curve, 'parity': parity, 'overlay': overlay, 'few_shot': few_shot,
-           'benchmark': benchmark}
+           'benchmark': benchmark, 'test_parity': test_parity, 'width_error': width_error,
+           'light_overlay': light_overlay}
 
 if __name__ == '__main__':
     for name in sys.argv[1:] or FIGURES:

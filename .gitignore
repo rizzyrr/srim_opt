@@ -10,8 +10,11 @@ srim_outputs/*
 !srim_outputs/sr_cache/
 !srim_outputs/dataset/
 !srim_outputs/dataset_cache/
+!srim_outputs/test_cache/
 !srim_outputs/figures/
 !srim_outputs/benchmark/
 srim_outputs/**/*.log
 srim_outputs/**/*.tmp
 srim_outputs/surrogate/validation_leave_materials_out.csv
+srim_outputs/dataset/live_status.json
+srim_outputs/surrogate/ablation_models/

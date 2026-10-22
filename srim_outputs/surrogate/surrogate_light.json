@@ -1,0 +1,273 @@
+{
+ "n_runs": 400,
+ "family": "light",
+ "features": "v1",
+ "ion_weighting": false,
+ "n_ref": null,
+ "shape_transform": "sqrt",
+ "hyper_runs": 400,
+ "restarts": 0,
+ "targets": [
+  "316L",
+  "CoCrFeMnNi",
+  "CoCrFeNi",
+  "Cr",
+  "Cu",
+  "CuCrZr",
+  "EUROFER97",
+  "Fe",
+  "Fe-9Cr",
+  "HT-9",
+  "Inconel-718",
+  "Mo",
+  "Ni",
+  "NiCoCr",
+  "SiC",
+  "T91",
+  "Ta",
+  "Ti",
+  "V",
+  "V-4Cr-4Ti",
+  "W",
+  "W-5Re",
+  "W-5Ta",
+  "Zircaloy-4",
+  "Zr"
+ ],
+ "ions": [
+  "H",
+  "He"
+ ],
+ "pairs": [
+  [
+   "316L",
+   "H"
+  ],
+  [
+   "316L",
+   "He"
+  ],
+  [
+   "CoCrFeMnNi",
+   "H"
+  ],
+  [
+   "CoCrFeMnNi",
+   "He"
+  ],
+  [
+   "CoCrFeNi",
+   "H"
+  ],
+  [
+   "CoCrFeNi",
+   "He"
+  ],
+  [
+   "Cr",
+   "H"
+  ],
+  [
+   "Cr",
+   "He"
+  ],
+  [
+   "Cu",
+   "H"
+  ],
+  [
+   "Cu",
+   "He"
+  ],
+  [
+   "CuCrZr",
+   "H"
+  ],
+  [
+   "CuCrZr",
+   "He"
+  ],
+  [
+   "EUROFER97",
+   "H"
+  ],
+  [
+   "EUROFER97",
+   "He"
+  ],
+  [
+   "Fe",
+   "H"
+  ],
+  [
+   "Fe",
+   "He"
+  ],
+  [
+   "Fe-9Cr",
+   "H"
+  ],
+  [
+   "Fe-9Cr",
+   "He"
+  ],
+  [
+   "HT-9",
+   "H"
+  ],
+  [
+   "HT-9",
+   "He"
+  ],
+  [
+   "Inconel-718",
+   "H"
+  ],
+  [
+   "Inconel-718",
+   "He"
+  ],
+  [
+   "Mo",
+   "H"
+  ],
+  [
+   "Mo",
+   "He"
+  ],
+  [
+   "Ni",
+   "H"
+  ],
+  [
+   "Ni",
+   "He"
+  ],
+  [
+   "NiCoCr",
+   "H"
+  ],
+  [
+   "NiCoCr",
+   "He"
+  ],
+  [
+   "SiC",
+   "H"
+  ],
+  [
+   "SiC",
+   "He"
+  ],
+  [
+   "T91",
+   "H"
+  ],
+  [
+   "T91",
+   "He"
+  ],
+  [
+   "Ta",
+   "H"
+  ],
+  [
+   "Ta",
+   "He"
+  ],
+  [
+   "Ti",
+   "H"
+  ],
+  [
+   "Ti",
+   "He"
+  ],
+  [
+   "V",
+   "H"
+  ],
+  [
+   "V",
+   "He"
+  ],
+  [
+   "V-4Cr-4Ti",
+   "H"
+  ],
+  [
+   "V-4Cr-4Ti",
+   "He"
+  ],
+  [
+   "W",
+   "H"
+  ],
+  [
+   "W",
+   "He"
+  ],
+  [
+   "W-5Re",
+   "H"
+  ],
+  [
+   "W-5Re",
+   "He"
+  ],
+  [
+   "W-5Ta",
+   "H"
+  ],
+  [
+   "W-5Ta",
+   "He"
+  ],
+  [
+   "Zircaloy-4",
+   "H"
+  ],
+  [
+   "Zircaloy-4",
+   "He"
+  ],
+  [
+   "Zr",
+   "H"
+  ],
+  [
+   "Zr",
+   "He"
+  ]
+ ],
+ "energy_MeV": [
+  0.103,
+  11.3
+ ],
+ "x_min": [
+  0.758149900630203,
+  -2.261281417423875,
+  1.0,
+  10.0
+ ],
+ "x_max": [
+  3.8322211282696355,
+  -0.6997310181524599,
+  2.0,
+  74.04939581103734
+ ],
+ "eta_baseline": "sr",
+ "components": {
+  "damage": 10,
+  "implant": 8
+ },
+ "variance_kept": {
+  "damage": 0.9245753127376634,
+  "implant": 0.9825188141069586
+ },
+ "fit_seconds": 23.4,
+ "trained": "2026-10-23 00:25",
+ "fluence_log_q80": 0.06447951913917654,
+ "band_calibrated_on": "20 high-statistics test runs",
+ "fluence_log_q80_seen_pairs": 0.0710607236480962
+}

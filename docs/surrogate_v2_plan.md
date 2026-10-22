@@ -1,5 +1,9 @@
 # Surrogate v2 on the desktop PC: plan for the first 3–4 h session
 
+> **Status (23 Oct 2026):** carried out in the session of 22-23 Oct. Results, the v1-v2 comparison and what is left
+> are in `docs/surrogate_v2_report.md`. Differences from this plan: 14YWT was dropped (12 alloys, not 13); TRIM
+> throughput is capped by Windows' GUI lock, so 8 workers were used, not 16.
+
 For the Claude Code session on Riz's desktop: start here. It's on the branch `riz-desktop`, made from `riz` after Part 1 was finished.
 
 Hardware: Ryzen 7 5800X3D (8 cores / 16 threads), RTX 2070 Super. Part 1 ran on a laptop with a Ryzen 7 PRO 4750U.

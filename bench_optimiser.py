@@ -144,7 +144,7 @@ def benchmark() -> pd.DataFrame:
     runs = sur.load_runs()
     held_pairs = {(t, ion) for ion, t, _ in CASES}
     print(f'Training a surrogate without the {len(held_pairs)} benchmark ion-target pairs...', flush=True)
-    model = sur.Surrogate.fit(sur.build_training_set([r for r in runs if (r[0], r[1].ion_symbol) not in held_pairs]))
+    model = sur.fit_family([r for r in runs if (r[0], r[1].ion_symbol) not in held_pairs], 'heavy')
     rows = []
     for ion, target, spec in CASES:
         sweeps = {n: reference_sweep(ion, target, n, runs) for n in dataset.BENCHMARK_IONS}

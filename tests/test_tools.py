@@ -78,3 +78,11 @@ def test_plan_is_labelled_confirmed(monkeypatch):
                                      progress=lambda *a: seen.append(a)))
     assert out['status'].startswith('CONFIRMED') and out['result']['energy_MeV'] == 12.0
     assert out['trim_runs'] == 1 and seen
+
+
+def test_raw_result_is_kept_for_charts_but_not_sent_to_the_model():
+    raw = {}
+    sent = tools.call_tool('screen_beam', {'material': 'CuCrZr', 'ion': 'Cu', 'target_dpa': 3.0,
+                                           'facility': 'HZDR 3 MV Tandetron'}, raw=raw)
+    assert isinstance(raw['result'], opt.ScreenResult) and raw['result'].best and raw['spec'].target_dpa == 3.0
+    assert 'curve' not in json.loads(sent)   # the full scan stays local

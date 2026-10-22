@@ -15,7 +15,8 @@ from plotly.subplots import make_subplots
 import srim_core as core
 import srim_optimiser as opt
 
-st.set_page_config(page_title='SRIM Damage Calculator', layout='wide')
+# Sidebar starts collapsed: the Ask (AI) tab does not use it; the Optimise and More tools tabs say to open it
+st.set_page_config(page_title='SRIM Damage Calculator', layout='wide', initial_sidebar_state='collapsed')
 
 # Default st.metric values are large enough to truncate long numbers and push deltas out of view
 st.markdown("""
@@ -25,6 +26,8 @@ st.markdown("""
 /* Periodic table: compact buttons so 18 columns fit the dialog */
 div[role="dialog"] [data-testid="stHorizontalBlock"] { gap: 0.2rem; }
 div[role="dialog"] .stButton button { padding: 0.15rem 0; min-height: 2rem; font-size: 0.8rem; }
+/* Less empty space above the tabs */
+[data-testid="stMainBlockContainer"], .block-container { padding-top: 2.2rem; }
 </style>
 """, unsafe_allow_html=True)
 
@@ -297,12 +300,19 @@ with st.sidebar:
     st.caption('Quick Kinchin-Pease, NRT dpa (Stoller et al. 2013/2019)')
 
     st.subheader('1. SRIM installation')
-    srim_dir = st.text_input('SRIM folder (contains TRIM.exe)', core.DEFAULT_SRIM_DIR)
+    srim_dir = st.text_input('SRIM folder (contains TRIM.exe)', core.saved_srim_dir(),
+                             placeholder=r'e.g. C:\Users\you\Documents\SRIM',
+                             help='Where SRIM-2013 is installed. It is remembered on this computer once TRIM.exe '
+                                  'is found. Predictions and the AI assistant work without it.').strip().strip('"')
     srim_error = core.check_srim_directory(srim_dir)
-    if srim_error:
+    if not srim_dir:   # not an error: predictions and the AI assistant work without SRIM
+        st.caption('Not set: needed only to run TRIM.')
+    elif srim_error:
         st.error(srim_error)
     else:
         st.success('TRIM.exe found', icon='✅')
+        if srim_dir != core.saved_srim_dir():
+            core.save_srim_dir(srim_dir)
 
     st.subheader('2. Ion beam')
     if 'pending_ion' in st.session_state:          # picked in the periodic table on the last run
@@ -427,9 +437,15 @@ can_run = not problems and not srim_error
 # Tabs
 # ---------------------------------------------------------------------------
 
-tab_guide, tab_chat, tab_single, tab_energy, tab_roi, tab_one, tab_opt, tab_compare, tab_conv = st.tabs(
-    ['Start here', 'Ask (AI)', 'Single run', 'Energy sweep', 'Fluence & ROI', 'Optimise (one-click)',
-     'Optimise (manual grid)', 'Compare runs', 'Convergence'])
+# Main tabs for planning an irradiation; the single-run tools sit one level down under "More tools"
+tab_guide, tab_chat, tab_optimise, tab_more = st.tabs(['Start here', 'Ask (AI)', 'Optimise', 'More tools'])
+with tab_optimise:
+    tab_one, tab_opt = st.tabs(['One-click', 'Manual grid'])
+with tab_more:
+    st.caption('Single TRIM runs and checks. The sidebar (» at the top left) sets the ion, material and number of '
+               'ions for these.')
+    tab_single, tab_energy, tab_roi, tab_compare, tab_conv = st.tabs(
+        ['Single run', 'Energy sweep', 'Fluence & ROI', 'Compare runs', 'Convergence'])
 
 with tab_guide:
     st.markdown(r"""
@@ -439,19 +455,23 @@ It runs **SRIM** for an ion beam hitting your material and turns the output into
 **radiation-damage profile (dpa vs depth)** and an **implanted-ion profile**, using the
 corrected Quick Kinchin-Pease method of Stoller et al. (2013, erratum 2019).
 
-### Typical workflow
-0. **Ask (AI):** describe the experiment in plain English and get the beam energy, fluence and beam time.
-   Every number comes from the tools below; predictions and TRIM-confirmed results are labelled as such.
-1. **Sidebar:** choose the ion, the material (start from a preset and edit the table) and the target thickness.
-2. **Single run:** pick a beam energy and fluence, press *Run*. A TRIM window opens and closes by itself.
-3. **Convergence:** check that your number of ions is large enough (results should change by less than a few %).
-4. **Energy sweep:** see how damage and ion range change with beam energy.
-5. **Fluence & ROI:** find the fluence that gives your target dpa, and the depth window (region of interest)
-   where the dpa is close to that value, away from the surface and the implanted ions.
-6. **Optimise (one-click):** give the damage you need (dpa, ROI depth and width, implant limit) and your
-   accelerator; it finds the beam energy and fluence and confirms them with one TRIM run of 1,000+ ions.
-7. **Optimise (manual grid):** the same question answered by running TRIM on an energy grid you choose.
-8. **Compare runs:** overlay any runs from this session (e.g. different alloys) at the same fluence.
+### Plan an irradiation
+- **Ask (AI):** describe the experiment in plain English and get the beam energy, fluence, beam time and
+  depth profiles. Every number comes from the optimiser; predictions and TRIM-confirmed results are labelled.
+- **Optimise → One-click:** the same answer from a form. Give the damage you need (dpa, ROI depth and width,
+  implant limit) and your accelerator; it finds the energy and fluence and confirms them with one TRIM run
+  of 1,000+ ions. The ion and material come from the sidebar.
+- **Optimise → Manual grid:** the same question answered by running TRIM on an energy grid you choose.
+
+The **sidebar** sets the SRIM folder (needed only for TRIM runs; it is remembered), the ion and the material.
+
+### More tools
+- **Single run:** pick a beam energy and fluence, press *Run*. A TRIM window opens and closes by itself.
+- **Convergence:** check that your number of ions is large enough (results should change by less than a few %).
+- **Energy sweep:** see how damage and ion range change with beam energy.
+- **Fluence & ROI:** find the fluence that gives your target dpa, and the depth window (region of interest)
+  where the dpa is close to that value, away from the surface and the implanted ions.
+- **Compare runs:** overlay any runs from this session (e.g. different alloys) at the same fluence.
 
 Every run is remembered for this session and saved to disk, so repeating an identical run is instant.
 
@@ -466,15 +486,46 @@ Every run is remembered for this session and saved to disk, so repeating an iden
 | **ROI** | Region of interest: a depth band with roughly uniform dpa, used for TEM or nano-indentation. |
 """)
 
+# Shared by the Ask (AI) and One-click tabs
+OBJECTIVE_LABELS = {'width': 'Widest ROI (nm)', 'fluence': 'Fluence for target (ions/cm²)',
+                    'implant': 'Max implanted ions in ROI (appm)'}
+
+
+def objective_figure(curve, objective):
+    # Objective vs energy: the surrogate's scan as a line, every TRIM run as a point
+    fig = go.Figure()
+    scan = [c for c in curve if c['source'] == 'surrogate' and c['objective'] is not None]
+    if scan:
+        fig.add_trace(go.Scatter(x=[c['energy_MeV'] for c in scan], y=[c['objective'] for c in scan], mode='lines',
+                                 name='Surrogate scan', line=dict(color=COLORS[1], width=2),
+                                 hovertemplate='%{x:.3g} MeV: %{y:.4g}<extra>surrogate</extra>'))
+    for c in curve:
+        if c['source'].startswith('trim') and c['objective'] is not None:
+            fig.add_trace(go.Scatter(x=[c['energy_MeV']], y=[c['objective']], mode='markers', showlegend=False,
+                                     marker=dict(color=COLORS[0], size=10,
+                                                 symbol='circle' if c['source'] != 'trim300' else 'circle-open'),
+                                     hovertemplate=f"%{{x:.3g}} MeV: %{{y:.4g}}<extra>TRIM, {c['source'][4:]} ions"
+                                                   "</extra>"))
+    fig.add_trace(go.Scatter(x=[None], y=[None], mode='markers', name='TRIM runs (open: 300 ions)',
+                             marker=dict(color=COLORS[0], size=10)))
+    fig.update_layout(title=OBJECTIVE_LABELS[objective], height=340, margin=dict(l=10, r=10, t=40, b=10),
+                      legend=dict(orientation='h', yanchor='bottom', y=1.02, x=0))
+    fig.update_xaxes(title_text='Beam energy (MeV)', type='log')
+    fig.update_yaxes(title_text=OBJECTIVE_LABELS[objective], rangemode='tozero')
+    return fig
+
+
 # --- Ask (AI) ----------------------------------------------------------------
 # A chat agent (srim_agent.py, on Groq) that calls the same optimiser functions as the tabs below. It does
 # not use the sidebar's ion and material: the user names them in the question.
-CHAT_EXAMPLES = [
-    'I need 3 dpa in CuCrZr with Cu ions at the HZDR 3 MV Tandetron. What energy and fluence, and how long at '
-    '50 nA on 1 cm²?',
-    'Which facilities can deliver Fe ions above 20 MeV?',
-    '5 dpa in W with W ions on the JANNuS Japet 2 MV tandem, ROI starting at 1000 nm and at least 500 nm wide.',
-]
+CHAT_EXAMPLES = {   # chip label -> question
+    '3 dpa in CuCrZr at HZDR': 'I need 3 dpa in CuCrZr with Cu ions at the HZDR 3 MV Tandetron. What energy and '
+                               'fluence, and how long at 50 nA on 1 cm²?',
+    'Fe ions above 20 MeV': 'Which facilities can deliver Fe ions above 20 MeV?',
+    'Too deep for a 2 MV machine': '5 dpa in W with W ions on the JANNuS Japet 2 MV tandem, ROI starting at 1000 nm '
+                                   'and at least 500 nm wide.',
+}
+CHAT_AVATARS = {'user': ':material/person:', 'assistant': ':material/science:'}
 
 
 def _chat_tool_line(call):
@@ -484,9 +535,67 @@ def _chat_tool_line(call):
     return f"`{call['name']}` → {status}"
 
 
-def _show_chat_turn(turn):
-    with st.chat_message(turn['role']):
+def _chat_charts(call):
+    # Charts for one screen_beam or plan_beam call, from the full result the tools kept for the app:
+    # [(tab label, caption, figure)]. Prediction only: the surrogate's profile. Confirmed: TRIM's, with the
+    # surrogate's dashed over it, as in the One-click tab.
+    raw = call.get('raw') or {}
+    res, spec = raw.get('result'), raw.get('spec')
+    if res is None or not res.ok:
+        return []
+    m, name = opt._resolve_material(raw['material'])
+    confirmed = isinstance(res, opt.PlanResult)
+    if confirmed:
+        E, fluence, roi = res.energy_MeV, res.fluence, (res.roi_start_nm, res.roi_end_nm)
+    elif res.best:
+        b = res.best
+        E, fluence, roi = b['energy_MeV'], b['fluence'], (b['roi_start_nm'], b['roi_end_nm'])
+    else:
+        return []   # energy window from SR ranges only: nothing to draw
+    profiles, curves = [], []
+    if confirmed:
+        p = core._load_pickle(os.path.join(core.CACHE_DIR, f'{res.confirm_cache_key}.pkl'))
+        if p is not None:
+            profiles.append(p)
+            curves.append({'name': f'TRIM, {p.number_ions:,} ions', 'depth': p.depth_nm, 'dpa': p.dpa(fluence),
+                           'appm': p.implanted_appm(fluence)})
+    try:
+        import srim_surrogate
+        p = srim_surrogate.load_latest().predict_profiles(m, res.ion, [E * 1e6])[0]
+        profiles.append(p)
+        curves.append({'name': 'Surrogate prediction', 'depth': p.depth_nm, 'dpa': p.dpa(fluence),
+                       'appm': p.implanted_appm(fluence), 'dash': 'dash' if confirmed else None})
+    except Exception:
+        pass   # no model, or outside what it can predict: show what there is
+    label = f"{res.ion} → {name} at {E:g} MeV, {fluence:.3g} ions/cm²: " + (
+        'confirmed by TRIM' if confirmed else 'predicted by the surrogate model, not yet confirmed')
+    charts = []
+    if curves:
+        fig = depth_figure(curves, hline=spec.target_dpa, xmax=auto_xmax(profiles),
+                           segments=[('ROI', roi[0], roi[1], spec.target_dpa, COLORS[2])],
+                           vlines=[(profiles[0].implant_peak_nm, 'implant peak')])
+        fig.update_layout(height=500)
+        charts.append(('Depth profile', label, fig))
+    if res.curve:
+        charts.append(('Energy scan', label, objective_figure(res.curve, spec.objective)))
+    return charts
+
+
+def _show_chat_turn(turn, n):
+    with st.chat_message(turn['role'], avatar=CHAT_AVATARS[turn['role']]):
         st.markdown(turn['text'])
+        for i, call in enumerate(turn.get('tool_calls') or []):
+            if 'charts' not in call:   # drawn once, then kept with the turn
+                try:
+                    call['charts'] = _chat_charts(call)
+                except Exception as e:
+                    call['charts'] = []
+                    st.caption(f'Could not draw the charts for this result: {e}')
+            if call['charts']:
+                st.caption(call['charts'][0][1])
+                for k, (tab, (_, _, fig)) in enumerate(zip(st.tabs([c[0] for c in call['charts']]),
+                                                           call['charts'])):
+                    tab.plotly_chart(fig, key=f'chat_fig_{n}_{i}_{k}')
         if turn.get('tool_calls'):
             with st.expander(f"Tool calls ({len(turn['tool_calls'])}): where these numbers come from"):
                 for call in turn['tool_calls']:
@@ -500,7 +609,7 @@ with tab_chat:
     try:
         import srim_agent
         if st.session_state.get('chat_agent') is None:
-            st.session_state.chat_agent = srim_agent.Agent(srim_dir=srim_dir)
+            st.session_state.chat_agent = srim_agent.Agent(srim_dir=srim_dir, charts=True)
             st.session_state.chat_log = []
         chat_agent = st.session_state.chat_agent
         chat_agent.srim_dir = srim_dir
@@ -509,33 +618,31 @@ with tab_chat:
         st.warning(f'The AI assistant is not available: {e}')
 
     if chat_agent is not None:
-        c1, c2 = st.columns([4, 1])
-        c1.markdown('Describe the irradiation you need in plain English. The assistant answers with the same '
-                    'optimiser as the other tabs: **predicted** numbers come from the surrogate model in about a '
-                    'second, **confirmed** ones from a TRIM run (minutes; ask for it). Every number it quotes is '
-                    'checked against the tool results.')
-        c1.caption(f'Model: {chat_agent.model} on Groq.' + ('' if can_run else ' TRIM is not set up (see the '
-                   'sidebar), so only predictions are available.'))
-        if c2.button('New conversation', key='chat_reset'):
+        c1, c2 = st.columns([5, 1], vertical_alignment='center')
+        c1.markdown('Describe the irradiation in plain English: dose, material, ion and accelerator.')
+        c1.caption('Predictions come from the surrogate model in about a second; ask to confirm and it runs TRIM. '
+                   'Every number is checked against the optimiser\'s output. '
+                   f'{chat_agent.model} on Groq.' + ('' if can_run else ' TRIM is not set up, so only predictions '
+                                                     'are available.'))
+        if st.session_state.chat_log and c2.button('New chat', icon=':material/add:', key='chat_reset'):
             st.session_state.chat_agent = None
+            st.session_state.pop('chat_example', None)   # else the last example chip would ask itself again
             st.rerun()
 
-        for turn in st.session_state.chat_log:
-            _show_chat_turn(turn)
+        for n, turn in enumerate(st.session_state.chat_log):
+            _show_chat_turn(turn, n)
 
         question = None
         if not st.session_state.chat_log:
-            st.markdown('**Try:**')
-            for i, example in enumerate(CHAT_EXAMPLES):
-                if st.button(example, key=f'chat_example_{i}'):
-                    question = example
+            picked = st.pills('Try an example', list(CHAT_EXAMPLES), key='chat_example')
+            question = CHAT_EXAMPLES.get(picked)
         question = st.chat_input('e.g. 2 dpa in Fe-9Cr with Fe ions at Helsinki, ROI from 300 nm') or question
 
         if question:
             user_turn = {'role': 'user', 'text': question}
             st.session_state.chat_log.append(user_turn)
-            _show_chat_turn(user_turn)
-            with st.chat_message('assistant'):
+            _show_chat_turn(user_turn, len(st.session_state.chat_log) - 1)
+            with st.chat_message('assistant', avatar=CHAT_AVATARS['assistant']):
                 with st.status('Thinking...', expanded=False) as s:
                     def on_event(kind, data):
                         if kind == 'tool_call':
@@ -554,6 +661,12 @@ with tab_chat:
                         s.update(label='Done', state='complete', expanded=False)
                         answer = {'role': 'assistant', 'text': reply.text, 'tool_calls': reply.tool_calls,
                                   'unverified': reply.unverified}
+                        for call in reply.tool_calls:   # TRIM runs from the chat join the session's run history
+                            res = (call.get('raw') or {}).get('result')
+                            for r in getattr(res, 'runs', None) or []:
+                                run_p = core._load_pickle(os.path.join(core.CACHE_DIR, f"{r['cache_key']}.pkl"))
+                                if run_p is not None:
+                                    remember(run_p)
                     except Exception as e:
                         s.update(label='Failed', state='error')
                         answer = {'role': 'assistant', 'text': f'Sorry, the request failed: {e}'}
@@ -723,38 +836,10 @@ with tab_roi:
 # One-click optimiser (srim_optimiser.plan)
 # -----------------------------------------------------
 
-OBJECTIVE_LABELS = {'width': 'Widest ROI (nm)', 'fluence': 'Fluence for target (ions/cm²)',
-                    'implant': 'Max implanted ions in ROI (appm)'}
-
-
-def objective_figure(curve, objective):
-    # Objective vs energy: the surrogate's scan as a line, every TRIM run as a point
-    fig = go.Figure()
-    scan = [c for c in curve if c['source'] == 'surrogate' and c['objective'] is not None]
-    if scan:
-        fig.add_trace(go.Scatter(x=[c['energy_MeV'] for c in scan], y=[c['objective'] for c in scan], mode='lines',
-                                 name='Surrogate scan', line=dict(color=COLORS[1], width=2),
-                                 hovertemplate='%{x:.3g} MeV: %{y:.4g}<extra>surrogate</extra>'))
-    for c in curve:
-        if c['source'].startswith('trim') and c['objective'] is not None:
-            fig.add_trace(go.Scatter(x=[c['energy_MeV']], y=[c['objective']], mode='markers', showlegend=False,
-                                     marker=dict(color=COLORS[0], size=10,
-                                                 symbol='circle' if c['source'] != 'trim300' else 'circle-open'),
-                                     hovertemplate=f"%{{x:.3g}} MeV: %{{y:.4g}}<extra>TRIM, {c['source'][4:]} ions"
-                                                   "</extra>"))
-    fig.add_trace(go.Scatter(x=[None], y=[None], mode='markers', name='TRIM runs (open: 300 ions)',
-                             marker=dict(color=COLORS[0], size=10)))
-    fig.update_layout(title=OBJECTIVE_LABELS[objective], height=340, margin=dict(l=10, r=10, t=40, b=10),
-                      legend=dict(orientation='h', yanchor='bottom', y=1.02, x=0))
-    fig.update_xaxes(title_text='Beam energy (MeV)', type='log')
-    fig.update_yaxes(title_text=OBJECTIVE_LABELS[objective], rangemode='tozero')
-    return fig
-
-
 with tab_one:
     st.markdown('Give the damage you need and your accelerator; this finds the **beam energy and fluence** with '
                 'as few TRIM runs as possible and confirms the answer with one TRIM run of at least 1,000 ions. '
-                'It uses the ion and material from the sidebar.')
+                f'It uses the ion (now **{ion}**) and material from the sidebar: open it with » at the top left.')
     st.caption('With a trained surrogate model (`python srim_surrogate.py fit`) the energies are scanned in under a '
                'second and only the confirmation needs TRIM. Without one, a short search with 300-ion runs comes '
                'first. The number of ions in the sidebar is not used here.')

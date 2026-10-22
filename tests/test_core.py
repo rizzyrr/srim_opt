@@ -74,3 +74,17 @@ def test_max_fluence_cap(synthetic_profile):
     r = core.roi_options(p, 2.0, 0.1, 100, 100, 100, 'width', None)
     assert r is not None
     assert core.roi_options(p, 2.0, 0.1, 100, 100, 100, 'width', None, max_fluence=r['fluence'] * 0.01) is None
+
+
+def test_srim_folder_comes_from_env_then_saved_setting(tmp_path, monkeypatch):
+    monkeypatch.setattr(core, 'SETTINGS_PATH', str(tmp_path / 'settings.json'))
+    monkeypatch.delenv('SRIM_DIR', raising=False)
+    assert core.saved_srim_dir() == ''
+    core.save_srim_dir(r'D:\SRIM')
+    assert core.saved_srim_dir() == r'D:\SRIM'
+    monkeypatch.setenv('SRIM_DIR', r'E:\Other')
+    assert core.saved_srim_dir() == r'E:\Other'
+
+
+def test_no_srim_folder_gives_a_clear_message():
+    assert 'No SRIM folder set' in core.check_srim_directory('')

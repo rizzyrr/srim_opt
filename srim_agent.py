@@ -48,7 +48,18 @@ checked, say so.
 TRIM).
 6. Use screen_beam first. plan_beam runs TRIM for 2-15 minutes: call it only when the user asks for \
 verified or confirmed numbers.
-7. Be brief and concrete. The users are physicists: use units, skip basics."""
+7. Be brief and concrete. The users are physicists: use units, skip basics. For a beam answer: one sentence \
+with the answer and whether it is predicted or confirmed, then a two-column table (Quantity | Value) with \
+these rows when the result has them: beam energy, fluence, ROI depth (start-end and width), dpa range in the \
+ROI, peak dpa, charge state and terminal voltage, and beam time if asked. Do not repeat inputs the user gave \
+(current, area). Then one line naming the defaults assumed. Do not name tools or JSON fields, and do not list numbers the user did not need; they \
+can open the tool calls for the rest."""
+
+# Added when the app draws charts under the answer (not in the terminal)
+CHARTS_NOTE = """
+8. The app shows charts under your answer for every screen_beam and plan_beam result: the dpa and \
+implanted-ion depth profiles with the ROI marked, and the objective against beam energy. You can point to \
+them ("see the depth profile below"), but read numbers only from the tool results, not from the charts."""
 
 
 # ---------------------------------------------------------------------------
@@ -130,8 +141,9 @@ class Agent:
     """A conversation. ask() can be called repeatedly; the history is kept in self.messages."""
 
     def __init__(self, model: Optional[str] = None, client=None, temperature: float = 0.2,
-                 srim_dir: Optional[str] = None):
+                 srim_dir: Optional[str] = None, charts: bool = False):
         self.srim_dir = srim_dir   # SRIM folder for screen_beam and plan_beam (default: srim_core's)
+        prompt = SYSTEM_PROMPT + (CHARTS_NOTE if charts else '')
         if client is None:
             from groq import Groq
             key = os.environ.get('GROQ_API_KEY') or _windows_user_env('GROQ_API_KEY')
@@ -141,8 +153,8 @@ class Agent:
             client = Groq(api_key=key)
         self.client, self.temperature = client, temperature
         self.model = model or os.environ.get('GROQ_MODEL') or DEFAULT_MODEL
-        self.messages: List[dict] = [{'role': 'system', 'content': SYSTEM_PROMPT}]
-        self.sources: List[str] = [SYSTEM_PROMPT, json.dumps(tools.TOOLS)]
+        self.messages: List[dict] = [{'role': 'system', 'content': prompt}]
+        self.sources: List[str] = [prompt, json.dumps(tools.TOOLS)]
 
     def _complete(self):
         for attempt in range(3):
@@ -173,12 +185,15 @@ class Agent:
                     except json.JSONDecodeError:
                         args = None
                     emit('tool_call', {'name': c.function.name, 'args': args})
-                    result = (tools.call_tool(c.function.name, args, srim_dir=self.srim_dir,
+                    raw = {}
+                    result = (tools.call_tool(c.function.name, args, srim_dir=self.srim_dir, raw=raw,
                                               progress=lambda *p: emit('progress', dict(zip(
                                                   ('stage', 'step', 'total', 'message'), p))))
                               if args is not None else
                               json.dumps({'ok': False, 'message': 'Arguments were not valid JSON.'}))
-                    calls.append({'name': c.function.name, 'args': args, 'result': json.loads(result)})
+                    # raw (full result objects, for charts) stays local; only `result` goes to the model
+                    calls.append({'name': c.function.name, 'args': args, 'result': json.loads(result),
+                                  'raw': raw or None})
                     emit('tool_result', calls[-1])
                     self.sources.append(result)
                     self.messages.append({'role': 'tool', 'tool_call_id': c.id, 'content': result})

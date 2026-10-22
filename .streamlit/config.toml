@@ -1,0 +1,17 @@
+# Look of the app (streamlit run srim_app.py reads this from the working directory). There is no base theme,
+# so the app follows the viewer's system or browser setting: light or dark, each with the colours below.
+
+[theme.light]
+primaryColor = "#2a78d6"            # the charts' first series colour, instead of Streamlit red
+backgroundColor = "#ffffff"
+secondaryBackgroundColor = "#f4f6f9"
+textColor = "#1f2933"
+
+[theme.dark]
+primaryColor = "#5b9cf0"            # the same blue, lighter so it reads on a dark background
+backgroundColor = "#0f1419"
+secondaryBackgroundColor = "#1a2129"
+textColor = "#e6e9ed"
+
+[client]
+toolbarMode = "minimal"             # hide Deploy and the developer menu

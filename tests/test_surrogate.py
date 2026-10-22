@@ -77,6 +77,21 @@ def test_fit_save_load_predict_round_trip(tmp_path):
     assert 0.5 * np.sum(np.abs(s_pred - ts.S[0])) * sur.DU < 0.05
 
 
+def test_update_adds_runs_without_refitting_kernels():
+    ts = _synthetic_set(n=50)
+    first, rest = ts.subset(np.arange(50) < 35), ts.subset(np.arange(50) >= 35)
+    model = sur.Surrogate.fit(first, eta_baseline=None)
+    updated = model.update(rest)
+    assert updated.info['n_runs'] == 50 and updated.info['updated_with_runs'] == 15
+    for g in sur.GROUPS:
+        assert np.array_equal(updated.a[f'theta_{g}'], model.a[f'theta_{g}'])
+    # The added runs are now fitted more closely than before
+    before, _ = model.predict_outputs(rest.X)
+    after, _ = updated.predict_outputs(rest.X)
+    Y = (rest.S - model.a['damage_mean']) @ model.a['damage_comp'].T
+    assert np.abs(after['damage'] - Y).mean() < np.abs(before['damage'] - Y).mean()
+
+
 def test_predicted_profile_works_with_roi_options(tmp_path):
     model = sur.Surrogate.fit(_synthetic_set(), eta_baseline=None)
     m = core.MATERIALS['Cu']

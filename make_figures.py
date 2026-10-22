@@ -3,9 +3,10 @@
 #   learning_curve.png   python srim_surrogate.py learning-curve
 #   parity.png           python srim_surrogate.py validate
 #   overlay.png          (fits its own model with every Cu and CuCrZr run left out)
+#   few_shot.png         python srim_surrogate.py few-shot
 #   benchmark.png        python bench_optimiser.py
 #
-#   python make_figures.py [learning_curve parity overlay benchmark]
+#   python make_figures.py [learning_curve parity overlay few_shot benchmark]
 
 import os
 import sys
@@ -148,6 +149,29 @@ def overlay(group: str = 'Cu + CuCrZr', ion: str = 'Cu', target: str = 'CuCrZr',
     _save(fig, 'overlay.png')
 
 
+def few_shot() -> None:
+    path = os.path.join(sur.MODEL_DIR, 'few_shot.csv')
+    if not os.path.exists(path):
+        print('few_shot.png: run "python srim_surrogate.py few-shot" first')
+        return
+    df = pd.read_csv(path)
+    ks = sorted(df.runs_added.unique())
+    fig, ax = plt.subplots(figsize=(5.4, 3.5))
+    for k, (group, g) in enumerate(df.groupby('holdout', sort=False)):
+        stats = g.groupby('runs_added')['fluence_error_median'].agg(['median', 'min', 'max']).reindex(ks) * 100
+        x = np.arange(len(ks))
+        color = COLORS[(k + 1) % 4]          # same colours per material as the parity plot
+        ax.plot(x, stats['median'], color=color, marker=MARKERS[(k + 1) % 4], lw=2, ms=5,
+                label=HOLDOUT_LABELS.get(group, group).replace(' not in training', ''))
+        ax.fill_between(x, stats['min'], stats['max'], color=color, alpha=0.15, lw=0)
+    ax.set_xticks(np.arange(len(ks)), [str(k) for k in ks])
+    ax.set_ylim(bottom=0)
+    ax.set_xlabel('TRIM runs of the new material fed back into the model')
+    ax.set_ylabel('Fluence error on that material (%)')
+    ax.legend(fontsize=8.5, title='Material left out of the training set', title_fontsize=8.5, alignment='left')
+    _save(fig, 'few_shot.png')
+
+
 def benchmark() -> None:
     if not os.path.exists(BENCH_CSV):
         print('benchmark.png: run "python bench_optimiser.py" first')
@@ -175,7 +199,8 @@ def benchmark() -> None:
     _save(fig, 'benchmark.png')
 
 
-FIGURES = {'learning_curve': learning_curve, 'parity': parity, 'overlay': overlay, 'benchmark': benchmark}
+FIGURES = {'learning_curve': learning_curve, 'parity': parity, 'overlay': overlay, 'few_shot': few_shot,
+           'benchmark': benchmark}
 
 if __name__ == '__main__':
     for name in sys.argv[1:] or FIGURES:

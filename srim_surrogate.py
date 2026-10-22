@@ -14,6 +14,7 @@
 #   python srim_surrogate.py validate         unseen ion-target pairs, then whole materials left out
 #                                             (Cu + CuCrZr, W, SiC)
 #   python srim_surrogate.py learning-curve   held-out error against the number of training runs
+#   python srim_surrogate.py few-shot         a new material: error after 0, 1, 2, 4, 8 of its runs
 
 import argparse
 import json
@@ -216,6 +217,19 @@ class _PerOutputGP:
         return np.column_stack(means), np.column_stack(stds)
 
 
+def _outputs(a: Dict[str, np.ndarray], ts: TrainingSet, eta_baseline: Optional[str]) -> Dict[str, np.ndarray]:
+    # What the Gaussian processes learn for each run: log damage-energy fraction against the baseline and
+    # the stopped fraction, then the PCA weights of the damage and implant shapes (basis in `a`)
+    base = np.zeros(len(ts))
+    if eta_baseline is not None:
+        for t, i in set(zip(ts.targets, ts.ions)):
+            rows = (ts.targets == t) & (ts.ions == i)
+            base[rows] = log_eta_baseline(core.MATERIALS[t], i, ts.energy_eV[rows], eta_baseline)
+    return {'totals': np.column_stack([ts.log_eta - base, ts.stopped]),
+            'damage': (ts.S - a['damage_mean']) @ a['damage_comp'].T,
+            'implant': (ts.G - a['implant_mean']) @ a['implant_comp'].T}
+
+
 def _n_components(sv: np.ndarray, cap: int, keep: float = 0.995) -> int:
     frac = np.cumsum(sv ** 2) / np.sum(sv ** 2)
     return int(min(cap, np.searchsorted(frac, keep) + 1))
@@ -251,14 +265,8 @@ class Surrogate:
             k = _n_components(sv, cap)
             a[f'{key}_mean'], a[f'{key}_comp'] = mean, vt[:k]
             a[f'{key}_var'] = np.array(float(np.sum(sv[:k] ** 2) / np.sum(sv ** 2)))
-        base = np.zeros(len(ts))
-        if eta_baseline is not None:
-            for t, i in set(zip(ts.targets, ts.ions)):
-                rows = (ts.targets == t) & (ts.ions == i)
-                base[rows] = log_eta_baseline(core.MATERIALS[t], i, ts.energy_eV[rows], eta_baseline)
-        a['Y_totals'] = np.column_stack([ts.log_eta - base, ts.stopped])
-        a['Y_damage'] = (ts.S - a['damage_mean']) @ a['damage_comp'].T
-        a['Y_implant'] = (ts.G - a['implant_mean']) @ a['implant_comp'].T
+        for g, Y in _outputs(a, ts, eta_baseline).items():
+            a[f'Y_{g}'] = Y
         xs = (ts.X - a['x_mean']) / a['x_std']
         rng = np.random.default_rng(0)
         idx = rng.choice(len(xs), min(len(xs), max_hyper_points), replace=False)   # hyperparameters on a subset
@@ -284,6 +292,26 @@ class Surrogate:
                 'variance_kept': {'damage': float(a['damage_var']), 'implant': float(a['implant_var'])},
                 'fit_seconds': round(time.time() - started, 1), 'trained': time.strftime('%Y-%m-%d %H:%M')}
         return cls(a, info, gps)
+
+    def update(self, ts: TrainingSet) -> 'Surrogate':
+        """This model refitted with extra runs, keeping its PCA basis, input scaling and kernels.
+
+        Takes seconds rather than a full fit, so a confirmation run on a new material can be fed back
+        straight away; a full fit (which also retunes the kernels) can follow later.
+        """
+        a = dict(self.a)
+        a['X'] = np.vstack([a['X'], ts.X])
+        for g, Y in _outputs(a, ts, self.info.get('eta_baseline')).items():
+            a[f'Y_{g}'] = np.vstack([a[f'Y_{g}'], Y])
+        info = dict(self.info, n_runs=self.info['n_runs'] + len(ts),
+                    targets=sorted(set(self.info['targets']) | set(ts.targets.tolist())),
+                    ions=sorted(set(self.info['ions']) | set(ts.ions.tolist())),
+                    energy_MeV=[min(self.info['energy_MeV'][0], float(ts.energy_eV.min() / 1e6)),
+                                max(self.info['energy_MeV'][1], float(ts.energy_eV.max() / 1e6))],
+                    x_min=np.minimum(self.info['x_min'], ts.X.min(0)).tolist(),
+                    x_max=np.maximum(self.info['x_max'], ts.X.max(0)).tolist(),
+                    updated_with_runs=self.info.get('updated_with_runs', 0) + len(ts))
+        return Surrogate(a, info)
 
     def save(self, path: str = MODEL_PATH) -> None:
         os.makedirs(os.path.dirname(path), exist_ok=True)
@@ -509,11 +537,50 @@ def cmd_learning_curve() -> None:
     print(f'Saved {path}')
 
 
+def cmd_few_shot(ks: Sequence[int] = (0, 1, 2, 4, 8), seeds: int = 4) -> None:
+    # A material the model has never seen, then k of its TRIM runs fed back with update(): how quickly the
+    # error falls. In use, each confirmation run on a new material is such a run.
+    import pandas as pd
+    runs = load_runs()
+    rows = []
+    for group, names in HOLDOUT_GROUPS.items():
+        held = [r for r in runs if r[0] in names]
+        rng = np.random.default_rng(0)
+        order = rng.permutation(len(held))
+        pool, test = [held[i] for i in order[:max(ks)]], [held[i] for i in order[max(ks):]]
+        if len(test) < 10:
+            print(f'{group}: only {len(held)} runs yet')
+            continue
+        model0 = Surrogate.fit(build_training_set([r for r in runs if r[0] not in names]))
+        for k in ks:
+            for seed in range(seeds if k else 1):
+                add = [pool[i] for i in rng.choice(len(pool), k, replace=False)] if k else []
+                model = model0.update(build_training_set(add)) if add else model0
+                res = evaluate_on(model, test)
+                pct = lambda key, q=50: float(np.nanpercentile(np.abs([r[key] for r in res]), q))   # noqa: E731
+                rows.append({'holdout': group, 'runs_added': k, 'seed': seed, 'n_test': len(test),
+                             'fluence_error_median': pct('fluence_error'), 'fluence_error_p90': pct('fluence_error', 90),
+                             'damage_energy_error_median': pct('damage_energy_error'),
+                             'shape_error_median': pct('shape_error')})
+            sel = [r for r in rows if r['holdout'] == group and r['runs_added'] == k]
+            print(f'{group:12} +{k} runs: fluence error median '
+                  f'{100 * np.median([r["fluence_error_median"] for r in sel]):4.1f}% '
+                  f'(seeds {100 * min(r["fluence_error_median"] for r in sel):.1f}-'
+                  f'{100 * max(r["fluence_error_median"] for r in sel):.1f}%), '
+                  f'damage energy {100 * np.median([r["damage_energy_error_median"] for r in sel]):4.1f}%, '
+                  f'n_test {len(test)}', flush=True)
+    path = os.path.join(MODEL_DIR, 'few_shot.csv')
+    os.makedirs(MODEL_DIR, exist_ok=True)
+    pd.DataFrame(rows).to_csv(path, index=False)
+    print(f'Saved {path}')
+
+
 def main(argv=None) -> None:
-    parser = argparse.ArgumentParser(description='TRIM surrogate: fit, validate, learning curve')
-    parser.add_argument('cmd', choices=['fit', 'validate', 'learning-curve'])
+    parser = argparse.ArgumentParser(description='TRIM surrogate: fit, validate, learning curve, few-shot')
+    parser.add_argument('cmd', choices=['fit', 'validate', 'learning-curve', 'few-shot'])
     args = parser.parse_args(argv)
-    {'fit': cmd_fit, 'validate': cmd_validate, 'learning-curve': cmd_learning_curve}[args.cmd]()
+    {'fit': cmd_fit, 'validate': cmd_validate, 'learning-curve': cmd_learning_curve,
+     'few-shot': cmd_few_shot}[args.cmd]()
 
 
 if __name__ == '__main__':

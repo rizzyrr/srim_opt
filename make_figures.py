@@ -122,7 +122,7 @@ def _pick(runs, energies_MeV):
 
 
 def overlay(group: str = 'Cu + CuCrZr', ion: str = 'Cu', target: str = 'CuCrZr',
-            energies_MeV=(2.0, 5.0, 12.0)) -> None:
+            energies_MeV=(2.04, 5.92, 12.1)) -> None:     # benchmark sweep energies, which have 1000-ion runs
     runs = sur.load_runs()
     names = sur.HOLDOUT_GROUPS[group]
     cands = [p for n, p, _ in runs if n == target and p.ion_symbol == ion]
@@ -150,10 +150,12 @@ def overlay(group: str = 'Cu + CuCrZr', ion: str = 'Cu', target: str = 'CuCrZr',
     ax.set_xlabel('Depth (µm)')
     ax.set_ylabel('dpa at 10¹⁵ ions/cm²')
     ax.set_title(f'{ion} → {target}: surrogate trained without any Cu or CuCrZr target', fontsize=9.5, loc='left')
-    ax.legend(handles=[Line2D([], [], color=MUTED, lw=1.1, label='TRIM'),
+    ions = sorted({p.number_ions for p in _pick(cands, energies_MeV)})
+    ax.legend(handles=[Line2D([], [], color=MUTED, lw=1.1,
+                              label=f'TRIM ({" and ".join(map(str, ions))} ions)'),
                        Line2D([], [], color=MUTED, lw=2, ls='--', label='surrogate (mean)'),
                        Patch(color=MUTED, alpha=0.25, lw=0, label="surrogate's 80 % band")],
-              loc='upper right', fontsize=8.5)
+              loc='upper center', bbox_to_anchor=(0.5, -0.16), ncol=3, fontsize=8.5)
     _save(fig, 'overlay.png')
 
 

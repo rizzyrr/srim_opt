@@ -134,7 +134,8 @@ class BeamSpec:
     e_min_MeV: float = 1.0                  # accelerator limits (replaced by the facility window if set)
     e_max_MeV: float = 10.0
     objective: str = 'width'                # 'width', 'fluence' or 'implant' (see core.OBJECTIVES)
-    width_slack: float = 0.05               # 'width': ROIs within 5 % of the widest tie; lowest fluence wins
+    width_slack: float = 0.05               # 'width': within one profile, ROIs within 5 % of the widest tie
+                                            # and the lowest fluence wins
     max_fluence: Optional[float] = None     # optional beam-time cap, ions/cm2
     ions_search: int = 300
     ions_confirm: int = 1000
@@ -249,15 +250,13 @@ def evaluate(p: core.DamageProfile, spec: BeamSpec) -> Optional[dict]:
 
 
 def pick_best(points: List[Tuple[float, Optional[dict]]], spec: BeamSpec) -> Optional[float]:
-    # Best energy among (energy, window) pairs. For the widest-ROI objective, energies within width_slack
-    # of the widest window tie, and the one needing the lowest fluence wins (as within one profile).
+    # Best energy among (energy, window) pairs; ties go to the lower fluence. width_slack is not applied
+    # between energies: widths from 300-ion runs or the surrogate are uncertain by more than 5 %, so such a
+    # tie would choose the energy on noise. (It still applies within one profile, where both windows come
+    # from the same run.)
     feas = [(E, r) for E, r in points if r is not None]
     if not feas:
         return None
-    if spec.objective == 'width' and spec.width_slack > 0:
-        w_max = max(r['roi_width_nm'] for _, r in feas)
-        feas = [(E, r) for E, r in feas if r['roi_width_nm'] >= (1 - spec.width_slack) * w_max]
-        return min(feas, key=lambda t: (t[1]['fluence'], t[0]))[0]
     return min(feas, key=lambda t: (score(t[1], spec.objective), t[0]))[0]
 
 
@@ -513,8 +512,16 @@ def plan(material: Union[str, core.Material], ion: str, spec: BeamSpec,
     result.energy_MeV = E_best
     result.confirm_cache_key = p.meta.get('cache_key')
     if result.prediction is not None:
+        # How well the surrogate knew the dose: its fluence for the confirmed energy and ROI against TRIM's.
+        # The confirmation can choose a different ROI when two windows are nearly equally good, and then the
+        # predicted and confirmed fluences belong to different windows.
         pred = result.prediction
-        pred['fluence_error'] = r['fluence'] / pred['fluence'] - 1 if pred['energy_MeV'] == E_best else None
+        q = _load_surrogate(surrogate).predict_profiles(m, ion, [E_best * 1e6], table=table)[0]
+        x = np.linspace(r['roi_start_nm'], r['roi_end_nm'], 50)
+        f_same = spec.target_dpa / float(np.interp(x, q.depth_nm, q.dpa(1.0)).mean())
+        overlap = min(r['roi_end_nm'], pred['roi_end_nm']) - max(r['roi_start_nm'], pred['roi_start_nm'])
+        pred.update(fluence_on_confirmed_roi=f_same, fluence_error=r['fluence'] / f_same - 1,
+                    roi_moved=bool(overlap < 0.5 * r['roi_width_nm']))
     if spec.facility:
         result.beam_setting = beam_setting(spec.facility, E_best, ion, spec.q_max)
     result.flags += _flags(p, r, E_best, max(e_lo, e_feas), e_hi, search_r, spec.objective)

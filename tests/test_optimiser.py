@@ -41,21 +41,18 @@ def test_search_lowest_fluence_finds_feasibility_edge():
 
 
 def test_search_interior_optimum():
-    # Widths within 5 % of the widest (2.66-6.0 MeV here) tie, and the lowest fluence wins
     runs = FakeRuns('width', lambda E: window(1000 - 300 * math.log(E / 4.0) ** 2, 1e15 * E))
-    best = opt._search(runs, 1.0, 10.0)
-    assert 2.6 <= best <= 6.0
-    runs = FakeRuns('width', lambda E: window(1000 - 300 * math.log(E / 4.0) ** 2, 1e15 * E))
-    runs.spec.width_slack = 0.0
     assert 3.0 <= opt._search(runs, 1.0, 10.0) <= 5.5
 
 
-def test_pick_best_prefers_lower_fluence_among_near_widest():
+def test_pick_best_takes_the_widest_energy():
+    # A slightly narrower but cheaper energy does not win: widths are not known to 5 % between energies
     spec = opt.BeamSpec(target_dpa=1.0)
-    pts = [(5.0, window(340, 1.0e16)), (10.0, window(345, 1.8e15)), (2.0, window(200, 1e15)), (3.0, None)]
+    pts = [(5.0, window(340, 1.8e15)), (10.0, window(345, 1.0e16)), (2.0, window(200, 1e15)), (3.0, None)]
     assert opt.pick_best(pts, spec) == 10.0
-    pts = [(5.0, window(345, 1.8e15)), (10.0, window(340, 1.0e16))]
-    assert opt.pick_best(pts, spec) == 5.0
+    pts = [(5.0, window(345, 1.0e16)), (10.0, window(345, 1.8e15))]   # equal widths: the lower fluence
+    assert opt.pick_best(pts, spec) == 10.0
+    assert opt.pick_best([(5.0, None)], spec) is None
 
 
 def test_search_nothing_feasible():

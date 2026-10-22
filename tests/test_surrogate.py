@@ -52,9 +52,19 @@ def _synthetic_set(n=40, seed=0):
                            X=X, log_eta=-1.0 + 0.2 * X[:, 0], stopped=np.ones(n), S=S, G=G, order=np.arange(n))
 
 
+def test_sr_nuclear_fraction():
+    E = np.geomspace(1e4, 6e7, 200)
+    half = core.RangeTable('X', E, np.full_like(E, 2.0), np.full_like(E, 2.0), E, E)
+    assert np.allclose(sur.sr_nuclear_fraction(half, [1e5, 1e7]), 0.5)
+    # Electronic stopping growing with energy: the nuclear share falls as the energy rises
+    falling = core.RangeTable('X', E, 1e-3 * E ** 0.5, np.full_like(E, 1.0), E, E)
+    f = sur.sr_nuclear_fraction(falling, [1e5, 1e6, 1e7])
+    assert np.all(np.diff(f) < 0) and np.all((0 < f) & (f < 1))
+
+
 def test_fit_save_load_predict_round_trip(tmp_path):
     ts = _synthetic_set()
-    model = sur.Surrogate.fit(ts)
+    model = sur.Surrogate.fit(ts, eta_baseline=None)
     path = str(tmp_path / 'model.npz')
     model.save(path)
     loaded = sur.Surrogate.load(path)
@@ -68,7 +78,7 @@ def test_fit_save_load_predict_round_trip(tmp_path):
 
 
 def test_predicted_profile_works_with_roi_options(tmp_path):
-    model = sur.Surrogate.fit(_synthetic_set())
+    model = sur.Surrogate.fit(_synthetic_set(), eta_baseline=None)
     m = core.MATERIALS['Cu']
     E = np.geomspace(1e4, 6e7, 60)
     table = core.RangeTable('Cu', E, E * 0, E * 0, 1e-3 * E ** 0.8, 3e-4 * E ** 0.8)

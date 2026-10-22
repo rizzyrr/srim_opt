@@ -172,7 +172,8 @@ def confirm_cases() -> pd.DataFrame:
         rows.append({'case': f'{ion} -> {target}', 'ok': r.ok, 'energy_MeV': r.energy_MeV, 'fluence': r.fluence,
                      'roi_nm': f'{r.roi_start_nm:.0f}-{r.roi_end_nm:.0f}' if r.ok else '',
                      'trim_runs': len(r.runs), 'seconds': round(r.elapsed_s), 'proposal': r.provenance.get('proposal'),
-                     'surrogate_fluence_error': pred.get('fluence_error'), 'message': r.message})
+                     'surrogate_fluence_error': pred.get('fluence_error'), 'roi_moved': pred.get('roi_moved'),
+                     'message': r.message})
         print('   ' + r.message, flush=True)
     return pd.DataFrame(rows)
 

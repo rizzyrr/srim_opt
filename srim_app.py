@@ -689,9 +689,12 @@ with tab_one:
                             f'{t["dpa_rate_roi_per_s"]:.2e} dpa/s in the ROI, {t["dpa_rate_peak_per_s"]:.2e} at the '
                             f'peak).')
             pred = res.prediction
-            if pred and pred.get('fluence_error') is not None:
-                st.caption(f'The surrogate predicted {pred["fluence"]:.3e} ions/cm² at this energy; the TRIM '
-                           f'confirmation gave {res.fluence:.3e} ({pred["fluence_error"]:+.0%}).')
+            if pred and pred.get('fluence_on_confirmed_roi') is not None:
+                moved = (f' It expected the best ROI at {pred["roi_start_nm"]:.0f}-{pred["roi_end_nm"]:.0f} nm; '
+                         f'the TRIM run found a better one.' if pred.get('roi_moved') else '')
+                st.caption(f'Surrogate check: for this energy and ROI it predicted '
+                           f'{pred["fluence_on_confirmed_roi"]:.3e} ions/cm², and TRIM gave {res.fluence:.3e} '
+                           f'({pred["fluence_error"]:+.0%}).' + moved)
             for flag in res.flags:
                 st.warning(flag)
 

@@ -758,7 +758,8 @@ def roi_options(p: DamageProfile, target_dpa: float, tol: float, min_width_nm: f
         if not ok.any():
             continue
         mean_k = (cum[j] - cum[i]) / widths
-        fluence = target_dpa / mean_k
+        ok &= mean_k > 0                  # a window with no damage at all (possible in a predicted profile)
+        fluence = target_dpa / np.where(mean_k > 0, mean_k, np.nan)
         if max_fluence is not None:
             ok &= fluence <= max_fluence
             if not ok.any():

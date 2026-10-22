@@ -6,12 +6,13 @@
 #   E_d        NRT dpa = 0.8 T_dam / (2 E_d)          -> the model predicts damage energy, not dpa
 #   depth      SR gives the projected range Rp(E)     -> profiles live on u = depth / Rp
 #   magnitude  totals are split from shapes           -> damage-energy fraction and stopped fraction
-#   partition  Lindhard-Robinson (the NRT formula)    -> the model learns TRIM's damage energy relative to it
+#   partition  SR's nuclear share of the stopping     -> the model learns TRIM's damage energy relative to it
 # The shapes left on the u grid are compressed with PCA, and a Gaussian process learns the PCA weights
 # and the two totals from four physics inputs: ZBL reduced energy, mass ratio M1/M2, Z1 and Z2.
 #
 #   python srim_surrogate.py fit              train on every run so far, print held-out errors, save
-#   python srim_surrogate.py validate         leave whole materials out (Cu + CuCrZr, W, SiC)
+#   python srim_surrogate.py validate         unseen ion-target pairs, then whole materials left out
+#                                             (Cu + CuCrZr, W, SiC)
 #   python srim_surrogate.py learning-curve   held-out error against the number of training runs
 
 import argparse
@@ -73,10 +74,34 @@ def lindhard_eta(Z1: float, M1: float, Z2: float, M2: float, energy_eV) -> np.nd
     return 1.0 / (1.0 + k * (3.4008 * eps ** (1 / 6) + 0.40244 * eps ** 0.75 + eps))
 
 
-def log_eta_baseline(material: core.Material, ion_symbol: str, energies_eV) -> np.ndarray:
+def sr_nuclear_fraction(table: core.RangeTable, energies_eV) -> np.ndarray:
+    # Fraction of its energy the ion loses in nuclear collisions while slowing from E to rest, from SR's
+    # stopping powers. They carry the Z1 oscillations of electronic stopping that Lindhard's smooth formula
+    # misses (Kr and Xe sit off its trend); what is left for the model is the share of recoil energy that
+    # becomes damage energy (about 0.5-0.7, smooth in the target).
+    e = table.energy_eV
+    f = table.Sn_eV_per_A / (table.Sn_eV_per_A + table.Se_eV_per_A)
+    cum = e[0] * f[0] + np.concatenate(([0.0], np.cumsum((f[1:] + f[:-1]) / 2 * np.diff(e))))
+    E = np.atleast_1d(np.asarray(energies_eV, dtype=float))
+    return np.interp(E, e, cum) / E
+
+
+ETA_BASELINES = ('sr', 'lindhard', None)
+
+
+def log_eta_baseline(material: core.Material, ion_symbol: str, energies_eV, kind: Optional[str] = 'sr',
+                     table: Optional[core.RangeTable] = None) -> np.ndarray:
+    # log of the damage-energy fraction the model is measured against: 'sr' (nuclear stopping share from
+    # SR), 'lindhard' (Lindhard-Robinson for the ion), or None (the model learns log(T_dam / E) directly)
+    E = np.atleast_1d(np.asarray(energies_eV, dtype=float))
+    kind = {'lindhard-robinson': 'lindhard'}.get(kind, kind)     # name used by models saved earlier
+    if kind is None:
+        return np.zeros(E.size)
+    if kind == 'sr':
+        return np.log(sr_nuclear_fraction(table or core.sr_table(material, ion_symbol), E))
     ion = core.element_data(ion_symbol)
     Z2, M2 = target_ZM(material)
-    return np.log(lindhard_eta(float(ion['z']), float(ion['mass']), Z2, M2, np.atleast_1d(energies_eV)))
+    return np.log(lindhard_eta(float(ion['z']), float(ion['mass']), Z2, M2, E))
 
 
 # ---------------------------------------------------------------------------
@@ -213,8 +238,11 @@ class Surrogate:
     # --- training --------------------------------------------------------
     @classmethod
     def fit(cls, ts: TrainingSet, max_hyper_points: int = 500, verbose: bool = False,
-            eta_baseline: bool = True, restarts: int = 0) -> 'Surrogate':
-        # eta_baseline=False learns log(T_dam / E) directly instead of relative to Lindhard-Robinson (ablation)
+            eta_baseline: Optional[str] = 'sr', restarts: int = 0) -> 'Surrogate':
+        # eta_baseline: what the damage energy is learnt relative to (see log_eta_baseline; the others are
+        # for the ablation)
+        if eta_baseline not in ETA_BASELINES:
+            raise ValueError(f'eta_baseline must be one of {ETA_BASELINES}')
         started = time.time()
         a = {'X': ts.X, 'x_mean': ts.X.mean(0), 'x_std': ts.X.std(0) + 1e-12}
         for key, M, cap in (('damage', ts.S, 8), ('implant', ts.G, 6)):
@@ -223,9 +251,11 @@ class Surrogate:
             k = _n_components(sv, cap)
             a[f'{key}_mean'], a[f'{key}_comp'] = mean, vt[:k]
             a[f'{key}_var'] = np.array(float(np.sum(sv[:k] ** 2) / np.sum(sv ** 2)))
-        base = (np.array([log_eta_baseline(core.MATERIALS[t], i, E)[0]
-                          for t, i, E in zip(ts.targets, ts.ions, ts.energy_eV)])
-                if eta_baseline else np.zeros(len(ts)))
+        base = np.zeros(len(ts))
+        if eta_baseline is not None:
+            for t, i in set(zip(ts.targets, ts.ions)):
+                rows = (ts.targets == t) & (ts.ions == i)
+                base[rows] = log_eta_baseline(core.MATERIALS[t], i, ts.energy_eV[rows], eta_baseline)
         a['Y_totals'] = np.column_stack([ts.log_eta - base, ts.stopped])
         a['Y_damage'] = (ts.S - a['damage_mean']) @ a['damage_comp'].T
         a['Y_implant'] = (ts.G - a['implant_mean']) @ a['implant_comp'].T
@@ -249,7 +279,7 @@ class Surrogate:
         info = {'n_runs': len(ts), 'targets': sorted(set(ts.targets.tolist())), 'ions': sorted(set(ts.ions.tolist())),
                 'energy_MeV': [float(ts.energy_eV.min() / 1e6), float(ts.energy_eV.max() / 1e6)],
                 'x_min': ts.X.min(0).tolist(), 'x_max': ts.X.max(0).tolist(),
-                'eta_baseline': 'lindhard-robinson' if eta_baseline else None,
+                'eta_baseline': eta_baseline,
                 'components': {'damage': int(len(a['damage_comp'])), 'implant': int(len(a['implant_comp']))},
                 'variance_kept': {'damage': float(a['damage_var']), 'implant': float(a['implant_var'])},
                 'fit_seconds': round(time.time() - started, 1), 'trained': time.strftime('%Y-%m-%d %H:%M')}
@@ -305,8 +335,7 @@ class Surrogate:
         X = features(material, ion_symbol, energies_eV)
         means, stds = self.predict_outputs(X)
         unc, inside = self.uncertainty(stds), self.in_domain(X)
-        base = (log_eta_baseline(material, ion_symbol, energies_eV) if self.info.get('eta_baseline')
-                else np.zeros(len(energies_eV)))
+        base = log_eta_baseline(material, ion_symbol, energies_eV, self.info.get('eta_baseline'), table)
         rng = np.random.default_rng(seed)
         profiles = []
         for i, E in enumerate(energies_eV):
@@ -366,13 +395,14 @@ def compare(p_true: core.DamageProfile, p_pred: core.DamageProfile) -> dict:
     s_pred, _ = shape_on_u(p_pred.depth_nm, p_pred.Tdam_density, Rp)
     out = {'shape_error': 0.5 * float(np.sum(np.abs(s_true - s_pred)) * DU),
            'damage_energy_error': p_pred.Tdam_eV / p_true.Tdam_eV - 1, 'fluence_error': np.nan,
-           'width_error': np.nan}
+           'width_error': np.nan, 'fluence_1dpa_trim': np.nan, 'fluence_1dpa_pred': np.nan}
     if r_true is not None:
         lo, hi = r_true['roi_start_nm'], r_true['roi_end_nm']
         x = np.linspace(lo, hi, 50)
         k_true = np.interp(x, p_true.depth_nm, p_true.dpa(1.0)).mean()
         k_pred = np.interp(x, p_pred.depth_nm, p_pred.dpa(1.0)).mean()
         out['fluence_error'] = k_true / k_pred - 1        # fluence ~ 1 / mean dpa per ion in the window
+        out['fluence_1dpa_trim'], out['fluence_1dpa_pred'] = 1 / k_true, 1 / k_pred
         out['width_error'] = ((r_pred['roi_width_nm'] if r_pred else 0.0) - r_true['roi_width_nm']) / r_true['roi_width_nm']
     return out
 
@@ -437,21 +467,23 @@ def cmd_fit() -> None:
 
 
 def cmd_validate() -> None:
+    # Unseen ion-target pairs, then whole materials left out
     runs = load_runs()
     rows_all = []
+    splits = {'unseen pairs': split_pairs(runs)}
     for group, names in HOLDOUT_GROUPS.items():
-        train = [r for r in runs if r[0] not in names]
-        held = [r for r in runs if r[0] in names]
+        splits[group] = ([r for r in runs if r[0] not in names], [r for r in runs if r[0] in names])
+    for group, (train, held) in splits.items():
         if not held:
             print(f'{group:12}: no runs yet')
             continue
         model = Surrogate.fit(build_training_set(train))
         rows = evaluate_on(model, held)
         rows_all += [{'holdout': group, **r} for r in rows]
-        print(f'{group:12} held out: ' + summarise(rows))
+        print(f'{group:12} held out: ' + summarise(rows), flush=True)
     if rows_all:
         import pandas as pd
-        path = os.path.join(MODEL_DIR, 'validation_leave_materials_out.csv')
+        path = os.path.join(MODEL_DIR, 'validation.csv')
         os.makedirs(MODEL_DIR, exist_ok=True)
         pd.DataFrame(rows_all).to_csv(path, index=False)
         print(f'Per-run errors: {path}')
@@ -466,9 +498,11 @@ def cmd_learning_curve() -> None:
     for n in [n for n in (50, 100, 200, 400, 800, 1200, 1600) if n < len(train)] + [len(train)]:
         model = Surrogate.fit(build_training_set(train[:n]))
         res = evaluate_on(model, held)
-        med = lambda k: float(np.nanmedian(np.abs([r[k] for r in res])))   # noqa: E731
+        med = lambda k, q=50: float(np.nanpercentile(np.abs([r[k] for r in res]), q))   # noqa: E731
         rows.append({'training_runs': n, 'fluence_error_median': med('fluence_error'),
-                     'width_error_median': med('width_error'), 'shape_error_median': med('shape_error')})
+                     'fluence_error_p90': med('fluence_error', 90), 'width_error_median': med('width_error'),
+                     'shape_error_median': med('shape_error'),
+                     'damage_energy_error_median': med('damage_energy_error')})
         print(f'{n:5d} runs: ' + summarise(res), flush=True)
     path = os.path.join(MODEL_DIR, 'learning_curve.csv')
     pd.DataFrame(rows).to_csv(path, index=False)

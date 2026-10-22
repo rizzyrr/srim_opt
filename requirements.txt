@@ -9,3 +9,4 @@ pysrim==0.5.10
 PyYAML==6.0.3
 scikit-learn==1.9.1
 pytest==9.1.1
+matplotlib==3.11.2   # make_figures.py only

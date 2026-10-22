@@ -1,12 +1,15 @@
 # Surrogate v2: results of the desktop session (22-23 Oct 2026)
 
-What was done, what it showed, and what Riz needs to decide. The plan is `docs/surrogate_v2_plan.md`.
+What was done and what it showed. Surrogate v2 is the model the app and the AI assistant use.
+
+The session set out to do four things: build a high-statistics test set that no model trains on, so the surrogate
+can be judged against clean TRIM results; add more materials; add H and He ions; and test three modelling
+changes to v1 (SR stopping-power inputs, weighting training runs by their ion count, and more PCA components).
 
 ## The decision
 
-**v2's heavy-ion model is better than v1 on the high-statistics test set, and is the default on `riz-desktop`.**
-(`srim_outputs/surrogate/surrogate.npz`; v1 is kept in `srim_outputs/surrogate/v1/`.) Merging into `riz` for the
-submission is Riz's call.
+**v2's heavy-ion model is better than v1 on the high-statistics test set, and is the default.**
+(`srim_outputs/surrogate/surrogate.npz`; v1 is kept in `srim_outputs/surrogate/v1/`.)
 
 | Heavy-ion test runs | v1 (as shipped) | v2 | Paired 90 % interval of the change |
 |---|---|---|---|
@@ -20,16 +23,16 @@ submission is Riz's call.
 
 What v2 is: v1's model (same inputs, PCA sizes and kernels), with the kernels tuned on every training run instead of
 a random 500, trained on 1,680 runs (v1's 1,350 plus 330 on the alloys), with its fluence band recalibrated on the
-high-statistics test runs. Every modelling change the plan proposed was tried and none beat v1 (below). Beside the
+high-statistics test runs. Every proposed modelling change was tried and none beat v1 (below). Beside the
 heavy-ion model, v2 adds a light-ion model for H and He (below), which v1 did not have at all.
 
 ## What was built
 
 | Step | Done | Where |
 |---|---|---|
-| 0. Setup and throughput | Python 3.13 venv, SRIM-2013 set up, `SRIM_DIR` now defaults to `~/Documents/SRIM`; 8/12/16-worker test (below) | `srim_core.py`, `srim_dataset.py throughput` |
+| 0. Setup and throughput | Python 3.13 venv, SRIM-2013 set up, and `~/Documents/SRIM` is used when no other SRIM folder is set; 8/12/16-worker test (below) | `srim_core.py`, `srim_dataset.py throughput` |
 | 1. High-statistics test set | 85 TRIM runs that no model trains on: 41 heavy-ion runs at 5,000 ions on the v1 targets, 24 at 3,000 on the new alloys, 20 H and He runs at 30,000 and 10,000 | `srim_dataset.py` (`kind='test'`), `srim_outputs/test_cache/`, `srim_surrogate.py evaluate-test` |
-| 2. More materials | 12 alloys (14YWT dropped at Riz's request) with nominal compositions and literature densities; 330 training runs | `core.MATERIALS`, `srim_app.PRESETS` |
+| 2. More materials | 12 alloys (14YWT dropped) with nominal compositions and literature densities; 330 training runs | `core.MATERIALS`, `srim_app.PRESETS` |
 | 3. H and He | A separate light-ion model on its own grid; 400 training runs | `srim_outputs/surrogate/surrogate_light.npz` |
 | 4. Modelling changes | Ablations: 10 changes against v1 for heavy ions, 6 for the light model, scored on the test set | `srim_surrogate.py ablation`, `srim_outputs/surrogate/ablation.csv` |
 | 5. Wrap-up | Figures, end-to-end `plan()` runs, the app, this report | `make_figures.py`, `srim_outputs/figures/` |
@@ -74,7 +77,7 @@ noisy case: rare high-energy recoils carry most of its damage energy (with a 1/T
 recoil's damage energy scatters by about 11 times its mean), so even 30,000 H ions leave 14-20 % noise per depth
 bin. Errors below these levels cannot be told from TRIM's own noise.
 
-Two metrics were added because the plan's fluence error is defined only where TRIM's own profile has an ROI flat
+Two metrics were added because the fluence error is defined only where TRIM's own profile has an ROI flat
 to ±10 %, which 25 of the 41 v1-target runs and 16 of the 24 alloy runs have (high-energy profiles rise too steeply):
 - **0.2-0.6 Rp dose error**: the fluence error for a fixed window on the rising side, defined for every run;
 - **truth noise**, as above, beside every error (`truth_noise_fixed` in the per-run CSVs).
@@ -123,7 +126,7 @@ ROI width errors (10-19 % medians) moved by less than their own uncertainty (int
 variant, and are left out of the table; they are in `srim_outputs/surrogate/ablation.csv`.
 
 What it showed:
-- **The plan's three changes do not beat v1.** SR inputs help on pairs in training but are significantly worse on
+- **The three proposed changes do not beat v1.** SR inputs help on pairs in training but are significantly worse on
   unseen pairs: the model leans on two inputs that are specific to each pair. Ion-count weighting does nothing, as
   only 60 training runs have more than 300 ions. More PCA components fit noise.
 - **The kernel fit is a lottery.** v1's hyperparameters are tuned on a random 500 of the runs. The saved v1 file
@@ -224,7 +227,7 @@ the run's own noise there is 2-4 %. That is why a single confirmation run is a p
 high-statistics test runs are the fair one. It also shows why the new noise flag matters: for the EUROFER97 case,
 `plan()` now says the confirmed dose is uncertain by about 8 %.
 
-**H and He, the plan's other two end-to-end cases**, each `screen()` in 1-2 s and then one TRIM confirmation:
+**H and He end to end**, each `screen()` in 1-2 s and then one TRIM confirmation:
 
 | Case | Energy | Fluence | ROI | Surrogate against the TRIM run | The run's own noise there |
 |---|---|---|---|---|---|
@@ -253,11 +256,10 @@ The queue is resumable (`srim_dataset.py run`); each item below adds jobs or a v
   test on a fitted profile instead of a smoothed one would make it steadier.
 - **Throughput** is capped by Windows' GUI lock at about 5 TRIM runs' worth; a second Windows session (a scheduled
   task as another user) or TRIM under Wine would raise it.
-- 14YWT was left out; Hugging Face still has v1 (updating needs a token for the `srimopt` organisation, and Riz's
-  go-ahead).
-- Active learning, and a GPU model once the dataset is past about 10,000 runs, as the plan said.
+- 14YWT was left out; Hugging Face still has v1 (updating it needs a token for the `srimopt` organisation).
+- Active learning, and a GPU model once the dataset is past about 10,000 runs.
 
-Also fixed on the way: the app's one-click tab defaulted to *Lowest fluence*, against `BeamSpec`'s and
-`OPTIMISER_PROBLEM.md`'s *Widest ROI*; the screen message printed the narrower v2 band as 1.3e+16-1.3e+16 (now three
+Also fixed on the way: the app's one-click tab defaulted to *Lowest fluence*, against `BeamSpec`'s default,
+*Widest ROI*; the screen message printed the narrower v2 band as 1.3e+16-1.3e+16 (now three
 significant figures); the energy-balance check flagged every H run, whose damage energy is only about 0.1 % of the
 beam energy (the gap must now also exceed 0.5 % of the beam energy, as it always does when a heavy-ion run is wrong).

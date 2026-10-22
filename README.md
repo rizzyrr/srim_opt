@@ -6,29 +6,33 @@ simulations of a few minutes each, plus a spreadsheet.
 
 srim_opt does it in one step:
 
-- **A surrogate model** trained on 1,357 TRIM runs predicts the answer in about a second.
+- **A surrogate model** trained on 2,080 TRIM runs predicts the answer in about a second.
 - **One real TRIM run** confirms the prediction.
 - **An AI assistant** takes the request in plain English and answers with numbers from these tools only.
 
 > **Ask (AI):** *"I need 3 dpa in CuCrZr with Cu ions at the HZDR 3 MV Tandetron. What energy and fluence,
 > and how long at 50 nA on 1 cm²?"*
 >
-> **Predicted:** 18 MeV Cu⁵⁺, 1.283 × 10¹⁶ ions/cm² (80 % band 1.219–1.347 × 10¹⁶), ROI 469.5–860.8 nm,
-> about 57 h of beam. Ask it to confirm, and it runs TRIM.
+> **Predicted:** 18 MeV Cu⁵⁺, 1.3 × 10¹⁶ ions/cm² (80 % band 1.27–1.33 × 10¹⁶), ROI 430–822 nm,
+> about 58 h of beam. Ask it to confirm, and it runs TRIM once you approve.
 
 ## Results
 
 | | |
 |---|---|
 | **TRIM runs to an answer** | 5 instead of 33 over five benchmark cases (19 min of TRIM instead of 109) |
-| **Surrogate accuracy** | 2.8 % median fluence error on ion–target pairs it never saw |
-| **Dataset** | 1,357 TRIM runs: 15 heavy ions (C to Au) into 13 nuclear materials, 0.5–50 MeV |
+| **Surrogate accuracy** | 0.9 % median fluence error (2.7 % at p90) on 41 high-statistics TRIM test runs; about 1.7 % for ion–target pairs left out of training |
+| **H and He** | A separate light-ion model: 1.8 % (H) and 2.7 % (He) median dose error, about TRIM's own noise |
+| **Dataset** | 1,680 heavy-ion TRIM runs (15 ions from C to Au into 25 materials: 13 nuclear materials and 12 alloys, 0.5–50 MeV), 400 H and He runs, and an 85-run test set |
 | **Facilities** | 11 accelerators, giving the energy window, charge state and terminal voltage |
 
 Four of the five benchmark cases matched the best energy found by a full grid. In the fifth, Ni → Ni for the
 lowest fluence, the answer needs 4.8 % more fluence than the best one. Figures are in
 [srim_outputs/figures/](srim_outputs/figures/), and the benchmark is in
 [srim_outputs/benchmark/](srim_outputs/benchmark/).
+
+The [surrogate v2 report](docs/surrogate_v2_report.md) has the full evaluation: the test set and its own
+noise, the ablation of 10 modelling changes, the new alloys, the H and He model, and end-to-end `plan()` runs.
 
 ## Quick start (Windows)
 
@@ -176,7 +180,8 @@ writes the answer from the tools' results. All physics runs locally in this repo
 - **The surrogate is a Gaussian process.** It predicts TRIM's damage-energy and implanted-ion profiles
   from the ion, the target and the energy. What physics already fixes (range scaling, the NRT formula, the
   displacement energy) is taken out before training. It proposes an energy, and one TRIM run of at least
-  1,000 ions confirms it.
+  1,000 ions confirms it (30,000 for H and He, whose runs are noisier). A second model covers H and He.
+  How v2 was tested and chosen: [docs/surrogate_v2_report.md](docs/surrogate_v2_report.md).
 - **Damage is NRT dpa** from SRIM Quick Kinchin-Pease (Stoller et al. 2013), with ASTM E521
   displacement energies.
 
@@ -309,11 +314,12 @@ At most 10 model calls are made per question, tool rounds included. Groq rate li
 | `srim_agent.py` | AI assistant: Groq tool-calling loop and the number check |
 | `srim_tools.py` | The optimiser as JSON tools for any LLM |
 | `srim_optimiser.py` | `screen()`, `plan()`, facility models and beam time |
-| `srim_surrogate.py` | Gaussian-process surrogate: `fit`, `validate`, `learning-curve`, `few-shot` |
+| `srim_surrogate.py` | Gaussian-process surrogate: `fit`, `validate`, `evaluate-test`, `ablation`, `learning-curve`, `few-shot` |
 | `srim_core.py` | TRIM and SR runs through pysrim, damage profiles, the run cache |
 | `srim_dataset.py` | Generates the training dataset on parallel TRIM workers |
 | `bench_optimiser.py`, `make_figures.py` | Benchmark and figures |
 | `srim_outputs/` | Trained model, dataset, SR tables, figures and benchmark (shared); run cache (local) |
+| `docs/surrogate_v2_report.md` | How surrogate v2 was tested against v1 and why it was chosen |
 
 The dataset and model are also on Hugging Face as private repos in the `srimopt` organisation. Their
 cards are in [docs/huggingface/](docs/huggingface/), and both are CC BY 4.0.

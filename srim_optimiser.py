@@ -139,7 +139,8 @@ class BeamSpec:
     max_fluence: Optional[float] = None     # optional beam-time cap, ions/cm2
     ions_search: int = 300
     ions_confirm: int = 1000
-    time_budget_s: float = 300.0            # soft limit for the whole plan, confirmation included
+    time_budget_s: float = 900.0            # soft limit for the whole plan, confirmation included (a TRIM
+                                            # search needs ~5-8 runs; with the surrogate it is one run)
     facility: Optional[str] = None          # a FACILITIES name
     q_max: Optional[int] = None             # highest charge state to use (default: the facility's)
 

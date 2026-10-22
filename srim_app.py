@@ -3,6 +3,9 @@
 # Built by Rizqullah Rasyiddin 01/10/2026
 
 
+import json
+import os
+
 import numpy as np
 import pandas as pd
 import plotly.graph_objects as go
@@ -10,6 +13,7 @@ import streamlit as st
 from plotly.subplots import make_subplots
 
 import srim_core as core
+import srim_optimiser as opt
 
 st.set_page_config(page_title='SRIM Damage Calculator', layout='wide')
 
@@ -133,12 +137,12 @@ def depth_figure(curves, show_implanted=True, hline=None, segments=(), xmax=None
                         row_heights=[0.62, 0.38] if rows == 2 else [1.0])
     for i, c in enumerate(curves):
         color = COLORS[i % MAX_SERIES]
+        line = dict(color=color, width=2, dash=c.get('dash'))   # optional 'dash' key, e.g. for predictions
         fig.add_trace(go.Scatter(x=c['depth'], y=c['dpa'], name=c['name'], legendgroup=c['name'],
-                                 line=dict(color=color, width=2),
-                                 hovertemplate='%{y:.3g} dpa'), row=1, col=1)
+                                 line=line, hovertemplate='%{y:.3g} dpa'), row=1, col=1)
         if show_implanted:
             fig.add_trace(go.Scatter(x=c['depth'], y=c['appm'], name=c['name'], legendgroup=c['name'],
-                                     showlegend=False, line=dict(color=color, width=2),
+                                     showlegend=False, line=line,
                                      hovertemplate='%{y:.3g} appm'), row=2, col=1)
     for name, x0, x1, y, color in segments:
         fig.add_trace(go.Scatter(x=[x0, x1], y=[y, y], mode='lines+markers', name=name,
@@ -354,9 +358,9 @@ can_run = not problems and not srim_error
 # Tabs
 # ---------------------------------------------------------------------------
 
-tab_guide, tab_single, tab_energy, tab_roi, tab_opt, tab_compare, tab_conv = st.tabs(
-    ['Start here', 'Single run', 'Energy sweep', 'Fluence & ROI', 'Optimise (experimental)', 'Compare runs',
-     'Convergence'])
+tab_guide, tab_single, tab_energy, tab_roi, tab_one, tab_opt, tab_compare, tab_conv = st.tabs(
+    ['Start here', 'Single run', 'Energy sweep', 'Fluence & ROI', 'Optimise (one-click)', 'Optimise (manual grid)',
+     'Compare runs', 'Convergence'])
 
 with tab_guide:
     st.markdown(r"""
@@ -373,9 +377,10 @@ corrected Quick Kinchin-Pease method of Stoller et al. (2013, erratum 2019).
 4. **Energy sweep:** see how damage and ion range change with beam energy.
 5. **Fluence & ROI:** find the fluence that gives your target dpa, and the depth window (region of interest)
    where the dpa is close to that value, away from the surface and the implanted ions.
-6. **Optimise (experimental):** give a target dpa and minimum ROI width; it searches beam energies and
-   calculates the fluence for each, then suggests the best combination.
-7. **Compare runs:** overlay any runs from this session (e.g. different alloys) at the same fluence.
+6. **Optimise (one-click):** give the damage you need (dpa, ROI depth and width, implant limit) and your
+   accelerator; it finds the beam energy and fluence and confirms them with one TRIM run of 1,000+ ions.
+7. **Optimise (manual grid):** the same question answered by running TRIM on an energy grid you choose.
+8. **Compare runs:** overlay any runs from this session (e.g. different alloys) at the same fluence.
 
 Every run is remembered for this session and saved to disk, so repeating an identical run is instant.
 
@@ -550,7 +555,178 @@ with tab_roi:
                         'depth or a smaller distance before the implant peak.')
 
 # -----------------------------------------------------
-# Optimise beam energy and fluence (experimental)
+# One-click optimiser (srim_optimiser.plan)
+# -----------------------------------------------------
+
+OBJECTIVE_LABELS = {'width': 'Widest ROI (nm)', 'fluence': 'Fluence for target (ions/cm²)',
+                    'implant': 'Max implanted ions in ROI (appm)'}
+
+
+def objective_figure(curve, objective):
+    # Objective vs energy: the surrogate's scan as a line, every TRIM run as a point
+    fig = go.Figure()
+    scan = [c for c in curve if c['source'] == 'surrogate' and c['objective'] is not None]
+    if scan:
+        fig.add_trace(go.Scatter(x=[c['energy_MeV'] for c in scan], y=[c['objective'] for c in scan], mode='lines',
+                                 name='Surrogate scan', line=dict(color=COLORS[1], width=2),
+                                 hovertemplate='%{x:.3g} MeV: %{y:.4g}<extra>surrogate</extra>'))
+    for c in curve:
+        if c['source'].startswith('trim') and c['objective'] is not None:
+            fig.add_trace(go.Scatter(x=[c['energy_MeV']], y=[c['objective']], mode='markers', showlegend=False,
+                                     marker=dict(color=COLORS[0], size=10,
+                                                 symbol='circle' if c['source'] != 'trim300' else 'circle-open'),
+                                     hovertemplate=f"%{{x:.3g}} MeV: %{{y:.4g}}<extra>TRIM, {c['source'][4:]} ions"
+                                                   "</extra>"))
+    fig.add_trace(go.Scatter(x=[None], y=[None], mode='markers', name='TRIM runs (open: 300 ions)',
+                             marker=dict(color=COLORS[0], size=10)))
+    fig.update_layout(title=OBJECTIVE_LABELS[objective], height=340, margin=dict(l=10, r=10, t=40, b=10),
+                      legend=dict(orientation='h', yanchor='bottom', y=1.02, x=0))
+    fig.update_xaxes(title_text='Beam energy (MeV)', type='log')
+    fig.update_yaxes(title_text=OBJECTIVE_LABELS[objective], rangemode='tozero')
+    return fig
+
+
+with tab_one:
+    st.markdown('Give the damage you need and your accelerator; this finds the **beam energy and fluence** with '
+                'as few TRIM runs as possible and confirms the answer with one TRIM run of at least 1,000 ions. '
+                'It uses the ion and material from the sidebar.')
+    st.caption('With a trained surrogate model (`python srim_surrogate.py fit`) the energies are scanned in under a '
+               'second and only the confirmation needs TRIM. Without one, a short search with 300-ion runs comes '
+               'first. The number of ions in the sidebar is not used here.')
+    c1, c2, c3, c4 = st.columns(4)
+    oc_dpa = c1.number_input('Target mean dpa in ROI', min_value=0.001, value=3.0, key='oc_dpa')
+    oc_tol = c2.number_input('Tolerance (± dpa)', min_value=0.0, value=0.15, format='%.3g', key='oc_tol',
+                             help='Sets the acceptable fluence range around the answer.')
+    oc_depth = c3.number_input('ROI starts below (nm)', min_value=0.0, value=100.0, key='oc_depth')
+    oc_width = c4.number_input('Minimum ROI width (nm)', min_value=1.0, value=100.0, key='oc_width')
+    c1, c2, c3, c4 = st.columns(4)
+    oc_obj = c1.selectbox('Optimise for', list(core.OBJECTIVES), format_func=core.OBJECTIVES.get, key='oc_obj',
+                          help='Widest ROI: windows within 5 % of the widest count as equal, and the one needing '
+                               'the lowest fluence wins.')
+    oc_imode = c2.radio('Implant limit', ['distance', 'percent'], horizontal=True, key='oc_imode',
+                        format_func={'distance': 'Gap before peak', 'percent': '% of peak'}.get)
+    if oc_imode == 'distance':
+        oc_margin = c3.number_input('ROI ends this far before the implant peak (nm)', min_value=0.0, value=100.0,
+                                    key='oc_margin')
+        oc_pct = 10.0
+    else:
+        oc_pct = c3.number_input('Implanted ions in ROI at most (% of their peak)', min_value=0.1, max_value=100.0,
+                                 value=10.0, key='oc_pct')
+        oc_margin = 0.0
+    oc_flat = c4.checkbox('Limit dpa spread in ROI', value=True, key='oc_flat')
+    oc_spread = c4.number_input('Max spread (± % of target)', min_value=1.0, max_value=100.0, value=10.0,
+                                key='oc_spread', disabled=not oc_flat)
+    c1, c2, c3, c4 = st.columns(4)
+    oc_fac = c1.selectbox('Accelerator', ['Custom energy limits'] + list(opt.FACILITIES), key='oc_fac',
+                          help='A facility sets the energy window from its terminal voltage and charge states.')
+    if oc_fac == 'Custom energy limits':
+        oc_emin = c2.number_input('Lowest energy (MeV)', min_value=0.01, value=1.0, key='oc_emin')
+        oc_emax = c3.number_input('Highest energy (MeV)', min_value=0.01, value=10.0, key='oc_emax')
+        oc_qmax = None
+    else:
+        oc_qmax = int(c2.number_input('Highest charge state', min_value=1, max_value=30,
+                                      value=opt.FACILITIES[oc_fac].q_max, key=f'oc_qmax_{oc_fac}'))
+        oc_emin, oc_emax, fac_notes = opt.energy_window(oc_fac, ion, oc_qmax)
+        c3.metric(f'Energy window for {ion}', f'{oc_emin:.3g}–{oc_emax:.3g} MeV')
+        for note in fac_notes:
+            c3.caption(note)
+    oc_cap = c4.number_input('Max fluence (ions/cm², 0 = no limit)', min_value=0.0, value=0.0, format='%.3e',
+                             key='oc_cap', help='A beam-time cap: windows that need more fluence are rejected.')
+    with st.expander('Beam current, for the irradiation time'):
+        b1, b2, b3 = st.columns(3)
+        oc_current = b1.number_input('Beam current (nA, electrical)', min_value=0.0, value=100.0, key='oc_current')
+        oc_q = int(b2.number_input('Charge state (when no accelerator is chosen)', min_value=1, value=2, key='oc_q'))
+        oc_area = b3.number_input('Irradiated area (cm²)', min_value=0.001, value=1.0, key='oc_area')
+
+    spec = opt.BeamSpec(target_dpa=oc_dpa, tol_dpa=oc_tol, min_depth_nm=oc_depth, min_width_nm=oc_width,
+                        implant_mode=oc_imode, implant_margin_nm=oc_margin, implant_pct=oc_pct,
+                        max_spread=oc_spread / 100 if oc_flat else None, e_min_MeV=oc_emin, e_max_MeV=oc_emax,
+                        objective=oc_obj, max_fluence=oc_cap or None,
+                        facility=None if oc_fac == 'Custom energy limits' else oc_fac, q_max=oc_qmax)
+    spec_problems = spec.validate()
+    for msg in spec_problems:
+        st.error(msg)
+    if st.button('Find best energy and fluence', type='primary', disabled=not can_run or bool(spec_problems),
+                 key='oc_run'):
+        with st.status('Optimising... TRIM windows will open and close by themselves.', expanded=False) as s:
+            def show_progress(stage, k, n, msg):
+                s.update(label=f'{stage.capitalize()} (run {k}): {msg}')
+            try:
+                result = opt.plan(material, ion, spec, srim_dir, progress=show_progress)
+                st.session_state.oneclick = (result, material, ion, spec)
+                for r in result.runs:   # every run joins this session's history
+                    run_p = core._load_pickle(os.path.join(core.CACHE_DIR, f"{r['cache_key']}.pkl"))
+                    if run_p is not None:
+                        remember(run_p)
+                s.update(label=f'Done in {result.elapsed_s:.0f} s with {len(result.runs)} TRIM runs',
+                         state='complete' if result.ok else 'error')
+            except Exception as e:
+                s.update(label=f'Optimiser failed: {e}', state='error')
+
+    oneclick = st.session_state.get('oneclick')
+    if oneclick:
+        res, res_material, res_ion, res_spec = oneclick
+        (st.success if res.ok else st.warning)(res.message)
+        if res.ok:
+            m = st.columns(5)
+            setting = res.beam_setting
+            m[0].metric('Beam energy', f'{res.energy_MeV:g} MeV',
+                        f"{res_ion}{setting['charge_state']}+ at {setting['terminal_MV']:g} MV" if setting else None,
+                        delta_color='off')
+            m[1].metric('Fluence', f'{res.fluence:.3e}',
+                        help=f'{res.fluence_min:.3e} to {res.fluence_max:.3e} ions/cm² keeps the ROI mean within '
+                             f'±{res_spec.tol_dpa:g} dpa.')
+            m[2].metric('ROI', f'{res.roi_start_nm:.0f}–{res.roi_end_nm:.0f} nm', f'{res.roi_width_nm:.0f} nm wide',
+                        delta_color='off')
+            m[3].metric('dpa across the ROI', f'{res.dpa_min_in_roi:.2f}–{res.dpa_max_in_roi:.2f}')
+            m[4].metric('Max implanted ions in ROI', f'{res.max_implanted_appm_in_roi:.3g} appm')
+            q = setting['charge_state'] if setting else oc_q
+            if oc_current > 0:
+                t = opt.beam_time(res.fluence, oc_current, q, oc_area, roi_mean_dpa=res_spec.target_dpa,
+                                  peak_dpa=res.peak_dpa)
+                st.markdown(f'**Beam time:** {t["hours"]:.2f} h at {oc_current:g} nA of {res_ion}{q}+ over '
+                            f'{oc_area:g} cm² ({t["flux_ions_per_cm2_s"]:.2e} ions/cm²/s; dose rate '
+                            f'{t["dpa_rate_roi_per_s"]:.2e} dpa/s in the ROI, {t["dpa_rate_peak_per_s"]:.2e} at the '
+                            f'peak).')
+            pred = res.prediction
+            if pred and pred.get('fluence_error') is not None:
+                st.caption(f'The surrogate predicted {pred["fluence"]:.3e} ions/cm² at this energy; the TRIM '
+                           f'confirmation gave {res.fluence:.3e} ({pred["fluence_error"]:+.0%}).')
+            for flag in res.flags:
+                st.warning(flag)
+
+            p_conf = core._load_pickle(os.path.join(core.CACHE_DIR, f'{res.confirm_cache_key}.pkl'))
+            if p_conf is not None:
+                curves = [{'name': f'TRIM, {p_conf.number_ions:,} ions', 'depth': p_conf.depth_nm,
+                           'dpa': p_conf.dpa(res.fluence), 'appm': p_conf.implanted_appm(res.fluence)}]
+                if pred:
+                    try:
+                        import srim_surrogate
+                        model = srim_surrogate.load_latest()
+                        p_pred = model.predict_profiles(res_material, res_ion, [res.energy_MeV * 1e6])[0]
+                        curves.append({'name': 'Surrogate prediction', 'depth': p_pred.depth_nm,
+                                       'dpa': p_pred.dpa(res.fluence), 'appm': p_pred.implanted_appm(res.fluence),
+                                       'dash': 'dash'})
+                    except Exception:
+                        pass   # the model changed or is gone: show the TRIM profile alone
+                vlines = [(res.implant_peak_nm, 'implant peak')]
+                if res.roi_limit_nm is not None and res.roi_limit_nm > 0:
+                    vlines.append((res.roi_limit_nm, 'ROI limit'))
+                st.plotly_chart(depth_figure(curves, hline=res_spec.target_dpa, xmax=auto_xmax([p_conf]),
+                                             segments=[('ROI', res.roi_start_nm, res.roi_end_nm, res_spec.target_dpa,
+                                                        COLORS[2])],
+                                             vlines=vlines, overlay=overlay), key='oc_fig')
+        if res.curve:
+            st.plotly_chart(objective_figure(res.curve, res_spec.objective), key='oc_curve')
+        st.download_button('Download the plan (JSON)', json.dumps(res.to_dict(), indent=1),
+                           file_name='irradiation_plan.json', mime='application/json')
+        with st.expander(f'TRIM runs used ({len(res.runs)})'):
+            st.dataframe(pd.DataFrame(res.runs), hide_index=True)
+            if res.provenance:
+                st.json(res.provenance)
+
+# -----------------------------------------------------
+# Optimise beam energy and fluence (manual grid)
 # -----------------------------------------------------
 
 def run_optimiser_energies(energies_eV, auto_size, label):

@@ -6,31 +6,65 @@
 #    NRT displacements       N_d(x)   = 0.8 * T_dam(x) / (2 * E_d)            [disp / A / ion]
 #    dpa                     dpa(x)   = N_d(x) * fluence / (atomic density * 1e-8 cm/A)
 
-# Initiialise packages
-from email.policy import default
-from email.policy import default
+# Initialise packages
 import hashlib
 import json
 import os
 import pickle
+import shutil
 import subprocess
+import sys
 import threading
 import time
+import types
 from dataclasses import asdict, dataclass, field, replace
-from typing import List, Optional, Tuple
+from typing import Dict, List, Optional, Tuple
 
 import numpy as np
 import pandas as pd
-from srim import TRIM, Ion, Layer, Target
-from srim.core.elementdb import ElementDB
-from srim.output import Results
+
+# pysrim imports distutils.spawn, which Python 3.12 removed. It only uses find_executable,
+# so give it shutil.which under that name before pysrim is imported.
+try:
+    import distutils.spawn  # noqa: F401
+except ImportError:
+    _spawn = types.ModuleType('distutils.spawn')
+    _spawn.find_executable = shutil.which
+    _distutils = types.ModuleType('distutils')
+    _distutils.spawn = _spawn
+    sys.modules.update({'distutils': _distutils, 'distutils.spawn': _spawn})
+
+# pysrim 0.5.10 also calls yaml.load without a Loader when it builds its element table, which
+# PyYAML 6 rejects. Supply the safe loader while pysrim is imported, then restore yaml.load.
+import yaml  # noqa: E402
+
+_yaml_load = yaml.load
+yaml.load = lambda stream, Loader=yaml.SafeLoader: _yaml_load(stream, Loader=Loader)
+try:
+    from srim import SR, TRIM, Ion, Layer, Target  # noqa: E402
+    from srim.core.elementdb import ElementDB  # noqa: E402
+    from srim.input import SRInput  # noqa: E402
+    from srim.output import Results, SRResults  # noqa: E402
+finally:
+    yaml.load = _yaml_load
 
 NA = 6.02214076e23  # atoms/mol
-DEFAULT_SRIM_DIR = r'C:\Users\Riz\Documents\SRIM'
-CACHE_DIR = os.path.join(os.path.dirname(os.path.abspath(__file__)), 'srim_outputs', 'cache')
+DEFAULT_SRIM_DIR = os.environ.get('SRIM_DIR', r'C:\Users\Riz\Documents\SRIM')
+OUTPUT_DIR = os.path.join(os.path.dirname(os.path.abspath(__file__)), 'srim_outputs')
+CACHE_DIR = os.path.join(OUTPUT_DIR, 'cache')                  # runs made from the app and the optimiser
+DATASET_CACHE_DIR = os.path.join(OUTPUT_DIR, 'dataset_cache')  # surrogate training runs (srim_dataset.py)
+SR_CACHE_DIR = os.path.join(OUTPUT_DIR, 'sr_cache')            # stopping/range tables
 
-# TRIM reads and writes fixed files inside the SRIM folder, so only one run may happen at a time per machine
-_trim_lock = threading.Lock()
+# TRIM and SR read and write fixed files inside their SRIM folder, so only one run may use a folder at a
+# time. Parallel runs need one folder copy each, in separate processes (pysrim writes to the cwd).
+_dir_locks: Dict[str, threading.Lock] = {}
+_dir_locks_guard = threading.Lock()
+
+
+def _dir_lock(srim_dir: str) -> threading.Lock:
+    key = os.path.normcase(os.path.abspath(srim_dir))
+    with _dir_locks_guard:
+        return _dir_locks.setdefault(key, threading.Lock())
 
 
 def element_data(symbol: str) -> dict:
@@ -155,15 +189,50 @@ class Material:
         parts = sorted(self.constituents, key=lambda c: -c.at_pct)
         return parts[0].symbol + ''.join(f'-{c.at_pct:.3g}{c.symbol}' for c in parts[1:])
 
-    def to_target(self) -> Target:
-        layer = Layer(
+    def to_layer(self) -> Layer:
+        return Layer(
             {c.symbol: {'stoich': float(x), 'E_d': c.E_d,
                         'lattice': _srim_nonzero(c.lattice), 'surface': _srim_nonzero(c.surface)}
              for c, x in zip(self.constituents, self.fractions)},
             density=self.density,
             width=self.width_A,
         )
-        return Target([layer])
+
+    def to_target(self) -> Target:
+        return Target([self.to_layer()])
+
+
+# ASTM E521 recommended displacement energies (eV). ASTM does not cover Si and C, so those are
+# commonly used values for SiC.
+E_D_ASTM = {'Al': 27.0, 'Ti': 30.0, 'Cu': 30.0, 'V': 40.0, 'Cr': 40.0, 'Mn': 40.0, 'Fe': 40.0, 'Co': 40.0,
+            'Ni': 40.0, 'Zr': 40.0, 'Nb': 40.0, 'Mo': 60.0, 'Ta': 90.0, 'W': 90.0, 'Si': 35.0, 'C': 20.0}
+
+
+def named_material(composition: Dict[str, float], unit: str = 'at',
+                   density: Optional[float] = None) -> Material:
+    # Material from {symbol: percent} in atomic ('at') or weight ('wt') %, with ASTM displacement energies
+    symbols = list(composition)
+    values = np.array([composition[s] for s in symbols], dtype=float)
+    at = values if unit == 'at' else convert_composition(symbols, values, to='at')
+    return Material(tuple(Constituent(s, float(x), E_D_ASTM[s]) for s, x in zip(symbols, at)),
+                    density_override=density)
+
+
+# Targets of the surrogate training set; also the materials the LLM interface can name
+MATERIALS: Dict[str, Material] = {
+    **{s: named_material({s: 100.0}) for s in ['Fe', 'Cr', 'Ni', 'Cu', 'W', 'Mo', 'Ta', 'V', 'Ti', 'Zr']},
+    'CuCrZr': named_material({'Cu': 99.11, 'Cr': 0.82, 'Zr': 0.07}),   # same composition as the app preset
+    'Fe-9Cr': named_material({'Fe': 91.0, 'Cr': 9.0}, unit='wt'),      # binary model alloy for EUROFER97
+    'SiC': named_material({'Si': 50.0, 'C': 50.0}, density=3.21),
+}
+
+
+def material_name(material: Material) -> Optional[str]:
+    # MATERIALS name of a material (at any thickness), or None if it is not one of them
+    for name, m in MATERIALS.items():
+        if m.constituents == material.constituents and m.density_override == material.density_override:
+            return name
+    return None
 
 # --------------------------------------------------------------------------------
 # Running TRIM
@@ -257,19 +326,42 @@ def _cache_key(material: Material, ion_symbol: str, energy_eV: float, number_ion
     return hashlib.sha1(payload.encode()).hexdigest()[:16]
 
 
-def cached_profiles(min_ions: int = 31) -> List[DamageProfile]:
+def _save_pickle(obj, path: str) -> None:
+    # Write, then rename, so an interrupted run never leaves a truncated cache file behind
+    os.makedirs(os.path.dirname(path), exist_ok=True)
+    tmp = f'{path}.{os.getpid()}.tmp'
+    with open(tmp, 'wb') as f:
+        pickle.dump(obj, f)
+    for attempt in range(5):
+        try:
+            os.replace(tmp, path)
+            return
+        except PermissionError:   # Windows: another process is reading the file at this moment
+            time.sleep(0.2 * (attempt + 1))
+    os.remove(tmp)
+
+
+def _load_pickle(path: str):
+    # The unpickled object, or None if the file is missing, truncated or from an incompatible code version
+    try:
+        with open(path, 'rb') as f:
+            return pickle.load(f)
+    except Exception:
+        return None
+
+
+def cached_profiles(min_ions: int = 31, cache_dir: str = CACHE_DIR) -> List[DamageProfile]:
     # Every valid run saved in the cache, oldest first
     # Skips files whose key no longer matches their inputs (made before the last cache
     # version bump) and runs below `min_ions` (sized_material's 30-ion pilot runs).
-    if not os.path.isdir(CACHE_DIR):
+    if not os.path.isdir(cache_dir):
         return []
-    paths = sorted((os.path.join(CACHE_DIR, f) for f in os.listdir(CACHE_DIR) if f.endswith('.pkl')),
+    paths = sorted((os.path.join(cache_dir, f) for f in os.listdir(cache_dir) if f.endswith('.pkl')),
                    key=os.path.getmtime)
     profiles = []
     for path in paths:
         try:
-            with open(path, 'rb') as f:
-                p = pickle.load(f)
+            p = _load_pickle(path)
             key = _cache_key(p.material, p.ion_symbol, p.energy_eV, p.number_ions, 1)
         except Exception:
             continue   # unreadable or from an older code version
@@ -291,19 +383,21 @@ def check_srim_directory(srim_dir: str) -> Optional[str]:
 
 def run_trim(material: Material, ion_symbol: str, energy_eV: float, number_ions: int = 1000,
              srim_dir: str = DEFAULT_SRIM_DIR, calculation: int = 1,
-             use_cache: bool = True) -> DamageProfile:
+             use_cache: bool = True, cache_dir: str = CACHE_DIR, timeout_s: Optional[float] = None,
+             minimised: bool = False) -> DamageProfile:
     # Run (or load from cache) one TRIM calculation and reduce it to damage profiles
+    # minimised=True starts the TRIM window minimised so background runs don't take the keyboard focus
     problems = material.validate()
     if problems:
         raise ValueError(' '.join(problems))
 
     key = _cache_key(material, ion_symbol, energy_eV, number_ions, calculation)
-    cache_path = os.path.join(CACHE_DIR, key + '.pkl')
+    cache_path = os.path.join(cache_dir, key + '.pkl')
     if use_cache and os.path.exists(cache_path):
-        with open(cache_path, 'rb') as f:
-            profile = pickle.load(f)
-        profile.meta['from_cache'] = True
-        return profile
+        profile = _load_pickle(cache_path)
+        if profile is not None:   # an unreadable file counts as a miss and is run again
+            profile.meta['from_cache'] = True
+            return profile
 
     err = check_srim_directory(srim_dir)
     if err:
@@ -311,20 +405,30 @@ def run_trim(material: Material, ion_symbol: str, energy_eV: float, number_ions:
 
     ion = Ion(ion_symbol, energy=energy_eV)
     trim = TRIM(material.to_target(), ion, number_ions=int(number_ions), calculation=calculation)
-    with _trim_lock:
-        results = _run_trim_exe(trim, srim_dir, timeout_s=max(600.0, 1.0 * number_ions))
+    started = time.time()
+    with _dir_lock(srim_dir):
+        # Heavy ions at tens of MeV need ~0.5 s per ion when several TRIM runs share the CPU
+        results = _run_trim_exe(trim, srim_dir, timeout_s=timeout_s or max(900.0, 2.5 * number_ions),
+                                minimised=minimised)
 
     profile = reduce_results(results, material, ion_symbol, energy_eV, number_ions)
-    profile.meta['cache_key'] = key
-
-    os.makedirs(CACHE_DIR, exist_ok=True)
-    with open(cache_path, 'wb') as f:
-        pickle.dump(profile, f)
+    profile.meta.update(cache_key=key, wall_s=time.time() - started, srim_dir=srim_dir)
+    _save_pickle(profile, cache_path)
     profile.meta['from_cache'] = False
     return profile
 
 
-def _run_trim_exe(trim: TRIM, srim_dir: str, timeout_s: float) -> Results:
+def _popen_options(minimised: bool) -> dict:
+    # Windows options for background runs: window minimised without taking the focus, below-normal priority
+    if not minimised or os.name != 'nt':
+        return {}
+    info = subprocess.STARTUPINFO()
+    info.dwFlags |= subprocess.STARTF_USESHOWWINDOW
+    info.wShowWindow = 7   # SW_SHOWMINNOACTIVE
+    return {'startupinfo': info, 'creationflags': subprocess.BELOW_NORMAL_PRIORITY_CLASS}
+
+
+def _run_trim_exe(trim: TRIM, srim_dir: str, timeout_s: float, minimised: bool = False) -> Results:
     # Like pysrim's TRIM.run, but with a timeout and a check that outputs are fresh
     # pysrim waits forever if TRIM hangs, and if TRIM dies early it silently parses the
     # previous run's output files. Neither is acceptable when the user can't see the code
@@ -334,7 +438,7 @@ def _run_trim_exe(trim: TRIM, srim_dir: str, timeout_s: float) -> Results:
     try:
         os.chdir(srim_dir)
         trim._write_input_files()
-        proc = subprocess.Popen([os.path.join(srim_dir, 'TRIM.exe')])
+        proc = subprocess.Popen([os.path.join(srim_dir, 'TRIM.exe')], **_popen_options(minimised))
         try:
             returncode = proc.wait(timeout=timeout_s)
         except subprocess.TimeoutExpired:
@@ -377,6 +481,134 @@ def reduce_results(results, material: Material, ion_symbol: str, energy_eV: floa
         Tdam_eV=Tdam, N_NRT=0.8 * Tdam / (2.0 * Ed),
         Tdam_balance_eV=Tdam_balance,
     )
+
+
+# ---------------------------------------------------------------------------
+# Stopping and range tables (SR Module): ranges in about a second, no Monte Carlo
+# ---------------------------------------------------------------------------
+
+SR_E_MAX_EV = 60e6   # one table per ion and material covers every energy the tools use
+
+
+@dataclass
+class RangeTable:
+    ion_symbol: str
+    energy_eV: np.ndarray
+    Se_eV_per_A: np.ndarray    # electronic stopping
+    Sn_eV_per_A: np.ndarray    # nuclear stopping
+    Rp_nm: np.ndarray          # projected range
+    dRp_nm: np.ndarray         # longitudinal straggling
+
+    def at(self, energy_eV: float) -> Tuple[float, float]:
+        # (projected range, straggling) in nm, interpolated in log-log
+        e, x = np.log(energy_eV), np.log(self.energy_eV)
+        return (float(np.exp(np.interp(e, x, np.log(self.Rp_nm)))),
+                float(np.exp(np.interp(e, x, np.log(self.dRp_nm)))))
+
+    def energy_for_range(self, Rp_nm: float) -> float:
+        # Lowest energy whose projected range reaches Rp_nm; inf if no energy in the table does
+        if Rp_nm > self.Rp_nm[-1]:
+            return float('inf')
+        return float(np.exp(np.interp(np.log(Rp_nm), np.log(self.Rp_nm), np.log(self.energy_eV))))
+
+    def to_json(self) -> dict:
+        return {k: (v.tolist() if isinstance(v, np.ndarray) else v) for k, v in asdict(self).items()}
+
+    @classmethod
+    def from_json(cls, d: dict) -> 'RangeTable':
+        return cls(d['ion_symbol'], *(np.asarray(d[k], dtype=float) for k in
+                                      ('energy_eV', 'Se_eV_per_A', 'Sn_eV_per_A', 'Rp_nm', 'dRp_nm')))
+
+
+def _material_key(material: Material) -> dict:
+    # Composition and density only: a stopping table does not depend on the target thickness
+    m = asdict(material)
+    m.pop('width_A')
+    m['constituents'] = [{k: (v if k == 'symbol' else float(v)) for k, v in c.items()} for c in m['constituents']]
+    m['density'] = float(material.density)
+    return m
+
+
+def sr_table(material: Material, ion_symbol: str, e_max_eV: float = SR_E_MAX_EV,
+             srim_dir: str = DEFAULT_SRIM_DIR, use_cache: bool = True, timeout_s: float = 120.0) -> RangeTable:
+    # Stopping powers, projected range and straggling from 10 keV to e_max_eV for one ion in one material
+    payload = json.dumps({'material': _material_key(material), 'ion': ion_symbol,
+                          'e_max_eV': float(e_max_eV), 'v': 1}, sort_keys=True)
+    path = os.path.join(SR_CACHE_DIR, hashlib.sha1(payload.encode()).hexdigest()[:16] + '.json')
+    if use_cache and os.path.exists(path):
+        try:
+            with open(path) as f:
+                return RangeTable.from_json(json.load(f))
+        except Exception:
+            pass   # unreadable: compute it again
+
+    err = check_srim_directory(srim_dir)
+    if err:
+        raise FileNotFoundError(err)
+    sr_dir = os.path.join(srim_dir, 'SR Module')
+    exe = os.path.join(sr_dir, 'SRModule.exe')
+    if not os.path.isfile(exe):
+        raise FileNotFoundError(f'SRModule.exe not found in {sr_dir}')
+
+    sr = SR(material.to_layer(), Ion(ion_symbol, energy=e_max_eV), energy_min=10e3, output_type=1)
+    out_path = os.path.join(sr_dir, sr.settings.output_filename)
+    with _dir_lock(srim_dir):
+        started = time.time()
+        current_directory = os.getcwd()
+        try:
+            os.chdir(sr_dir)
+            SRInput(sr).write()
+            proc = subprocess.Popen([exe], **_popen_options(True))
+            try:
+                proc.wait(timeout=timeout_s)
+            except subprocess.TimeoutExpired:
+                proc.kill()
+                raise TimeoutError(f'SRModule did not finish within {timeout_s:.0f} s and was stopped.')
+        finally:
+            os.chdir(current_directory)
+        if not os.path.exists(out_path) or os.path.getmtime(out_path) < started - 1:
+            raise RuntimeError('SRModule finished but did not write a new SR_OUTPUT.txt.')
+        data = SRResults(sr_dir).data   # keV, Se and Sn (eV/A), Rp and straggling (um), lateral straggling (um)
+
+    table = RangeTable(ion_symbol, data[0] * 1e3, data[1], data[2], data[3] * 1e3, data[4] * 1e3)
+    os.makedirs(SR_CACHE_DIR, exist_ok=True)
+    tmp = f'{path}.{os.getpid()}.tmp'
+    with open(tmp, 'w') as f:
+        json.dump(table.to_json(), f)
+    os.replace(tmp, path)
+    return table
+
+
+def sized_material_sr(material: Material, ion_symbol: str, energy_eV: float,
+                      table: Optional[RangeTable] = None, srim_dir: str = DEFAULT_SRIM_DIR) -> Material:
+    """Copy of `material` about 1.4x as thick as the ions reach (Rp + 3 straggling), from SR: no pilot run.
+
+    TRIM always uses 100 depth bins, so this keeps the bins small enough to resolve the ROI at every energy.
+    """
+    table = table or sr_table(material, ion_symbol, srim_dir=srim_dir)
+    Rp, dRp = table.at(energy_eV)
+    width_nm = max(100.0, np.ceil(1.4 * (Rp + 3 * dRp) / 50.0) * 50.0)
+    return replace(material, width_A=width_nm * 10)
+
+
+def target_too_thin(p: DamageProfile) -> bool:
+    # True if ions stop in the last few depth bins, so some probably went straight through the target
+    return bool(p.implanted.max() > 0 and p.implanted[-5:].max() > 0.02 * p.implanted.max())
+
+
+def run_sized(material: Material, ion_symbol: str, energy_eV: float, number_ions: int,
+              srim_dir: str = DEFAULT_SRIM_DIR, cache_dir: str = CACHE_DIR, table: Optional[RangeTable] = None,
+              minimised: bool = False, use_cache: bool = True, max_tries: int = 3) -> DamageProfile:
+    # TRIM run on an SR-sized target, made 1.5x thicker and run again if ions reach the back
+    m = sized_material_sr(material, ion_symbol, energy_eV, table, srim_dir)
+    for _ in range(max_tries):
+        p = run_trim(m, ion_symbol, energy_eV, number_ions, srim_dir, use_cache=use_cache, cache_dir=cache_dir,
+                     minimised=minimised)
+        if not target_too_thin(p):
+            return p
+        m = replace(m, width_A=m.width_A * 1.5)
+    p.meta['too_thin'] = True
+    return p
 
 
 # ---------------------------------------------------------------------------
@@ -468,7 +700,8 @@ def sized_material(material: Material, ion_symbol: str, energy_eV: float, srim_d
 
 def roi_options(p: DamageProfile, target_dpa: float, tol: float, min_width_nm: float,
                 min_depth_nm: float, implant_margin_nm: float, objective: str,
-                max_spread: Optional[float] = None) -> Optional[dict]:
+                max_spread: Optional[float] = None, *, implant_pct: Optional[float] = None,
+                max_fluence: Optional[float] = None, width_slack: float = 0.0) -> Optional[dict]:
     """Best ROI and fluence for one TRIM profile, or None if no window fits.
 
     Allowed windows: start at or below `min_depth_nm`, at least `min_width_nm` wide,
@@ -479,13 +712,38 @@ def roi_options(p: DamageProfile, target_dpa: float, tol: float, min_width_nm: f
 
     `max_spread` (optional, a fraction such as 0.1) additionally requires every point of
     the smoothed dpa profile inside the window to be within target * (1 +/- max_spread).
+
+    `implant_pct` (optional) replaces the distance rule: the smoothed implanted-ion
+    concentration must stay at or below `implant_pct` % of its peak everywhere in the window.
+    `max_fluence` (optional) drops windows that need more fluence than this (a beam-time cap).
+    `width_slack` (objective 'width' only): windows within this fraction of the widest count as equally
+    wide and the one needing the lowest fluence wins. A flat near-surface plateau and the rising flank
+    can give almost the same width at fluences 5x apart, so e.g. 0.05 avoids paying for 2 % more width.
     """
+    if objective == 'width' and width_slack > 0:
+        rules = dict(implant_pct=implant_pct, max_fluence=max_fluence)
+        widest = roi_options(p, target_dpa, tol, min_width_nm, min_depth_nm, implant_margin_nm, 'width',
+                             max_spread, **rules)
+        if widest is None:
+            return None
+        floor = max(min_width_nm, (1 - width_slack) * widest['roi_width_nm'])
+        return roi_options(p, target_dpa, tol, floor, min_depth_nm, implant_margin_nm, 'fluence', max_spread,
+                           **rules)
+
     d = p.depth_nm
     k = p.dpa(1.0)                    # dpa per (ion/cm2)
     k_smooth = smooth(k)
     imp = p.implanted_appm(1.0)       # appm per (ion/cm2)
     peak_idx = int(np.argmax(k))
-    max_end = p.implant_peak_nm - implant_margin_nm
+    if implant_pct is None:
+        max_end = p.implant_peak_nm - implant_margin_nm
+    else:
+        # The concentration rises from the surface towards the implant peak, so the window must end
+        # before the first depth where the smoothed concentration goes over the limit.
+        imp_smooth = smooth(imp)
+        over = np.flatnonzero(imp_smooth > implant_pct / 100 * imp_smooth.max())
+        first_over = int(over[0]) if over.size else len(d)
+        max_end = float(d[first_over - 1]) if first_over > 0 else -np.inf
     cum = np.concatenate(([0.0], np.cumsum((k[:-1] + k[1:]) / 2 * np.diff(d))))
 
     best, best_score = None, None
@@ -501,6 +759,10 @@ def roi_options(p: DamageProfile, target_dpa: float, tol: float, min_width_nm: f
             continue
         mean_k = (cum[j] - cum[i]) / widths
         fluence = target_dpa / mean_k
+        if max_fluence is not None:
+            ok &= fluence <= max_fluence
+            if not ok.any():
+                continue
         # dpa range in the window uses the smoothed profile: it should show the real gradient, not bin noise.
         seg_k, seg_imp = k_smooth[i:peak_idx + 1], imp[i:peak_idx + 1]
         max_imp = fluence * np.maximum.accumulate(seg_imp)[1:]
@@ -529,6 +791,7 @@ def roi_options(p: DamageProfile, target_dpa: float, tol: float, min_width_nm: f
                 'max_implanted_appm_in_roi': float(max_imp[m]),
                 'peak_dpa': float(fluence[m] * k.max()),
                 'implant_peak_nm': p.implant_peak_nm,
+                'roi_limit_nm': float(max_end),
                 'bin_nm': p.bin_nm,
             }
     return best
@@ -536,11 +799,13 @@ def roi_options(p: DamageProfile, target_dpa: float, tol: float, min_width_nm: f
 
 def rank_energies(profiles: List[DamageProfile], target_dpa: float, tol: float, min_width_nm: float,
                   min_depth_nm: float, implant_margin_nm: float, objective: str,
-                  max_spread: Optional[float] = None) -> pd.DataFrame:
+                  max_spread: Optional[float] = None, *, implant_pct: Optional[float] = None,
+                  max_fluence: Optional[float] = None, width_slack: float = 0.0) -> pd.DataFrame:
     """One row per energy (best window at that energy), best first; infeasible energies last."""
     rows = []
     for p in profiles:
-        r = roi_options(p, target_dpa, tol, min_width_nm, min_depth_nm, implant_margin_nm, objective, max_spread)
+        r = roi_options(p, target_dpa, tol, min_width_nm, min_depth_nm, implant_margin_nm, objective, max_spread,
+                        implant_pct=implant_pct, max_fluence=max_fluence, width_slack=width_slack)
         rows.append(r if r else {'energy_MeV': p.energy_eV / 1e6, 'bin_nm': p.bin_nm})
     df = pd.DataFrame(rows)
     if 'fluence' not in df:

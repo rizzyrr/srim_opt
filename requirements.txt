@@ -1,0 +1,11 @@
+# Python 3.10+ (tested on 3.13). SRIM-2013 itself is installed separately from srim.org (Windows).
+numpy==2.3.5
+scipy==1.18.1
+pandas==2.3.3
+pyarrow==26.0.0
+plotly==7.1.0
+streamlit==1.66.1
+pysrim==0.5.10
+PyYAML==6.0.3
+scikit-learn==1.9.1
+pytest==9.1.1

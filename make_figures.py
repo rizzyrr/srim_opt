@@ -78,7 +78,11 @@ def parity() -> None:
     if not os.path.exists(path):
         print('parity.png: run "python srim_surrogate.py validate" first')
         return
-    df = pd.read_csv(path).dropna(subset=['fluence_1dpa_trim', 'fluence_1dpa_pred'])
+    every = pd.read_csv(path).dropna(subset=['fluence_error'])    # runs where TRIM has an ROI window
+    # Medians count a prediction with no damage in the window as an infinite error; only finite points plot
+    stats = {g: (100 * np.median(np.abs(x.fluence_error)), len(x), int(np.isinf(x.fluence_error).sum()))
+             for g, x in every.groupby('holdout', sort=False)}
+    df = every[np.isfinite(every.fluence_1dpa_pred)]
     lo = 0.6 * min(df.fluence_1dpa_trim.min(), df.fluence_1dpa_pred.min())
     hi = 1.6 * max(df.fluence_1dpa_trim.max(), df.fluence_1dpa_pred.max())
     xs = np.array([lo, hi])
@@ -86,10 +90,11 @@ def parity() -> None:
     ax.fill_between(xs, xs / 1.2, xs * 1.2, color=GRID, alpha=0.7, lw=0, label='within 20 %')
     ax.plot(xs, xs, color=MUTED, lw=0.8)
     for k, (group, g) in enumerate(df.groupby('holdout', sort=False)):
-        err = 100 * np.median(np.abs(g.fluence_error))
+        err, n, no_damage = stats[group]
         ax.scatter(g.fluence_1dpa_trim, g.fluence_1dpa_pred, s=24, marker=MARKERS[k % 4], color=COLORS[k % 4],
                    edgecolor='white', linewidth=0.6, zorder=3,
-                   label=f'{HOLDOUT_LABELS.get(group, group)}: median error {err:.0f} % (n = {len(g)})')
+                   label=f'{HOLDOUT_LABELS.get(group, group)}: median error {err:.0f} % (n = {n}'
+                         + (f'; {no_damage} predicted no damage, not shown' if no_damage else '') + ')')
     ax.set_xscale('log')
     ax.set_yscale('log')
     ax.set_xlim(lo, hi)

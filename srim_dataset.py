@@ -231,6 +231,8 @@ def export(path: str = os.path.join(DATASET_DIR, 'srim_profiles.parquet')) -> No
     # One row per run: inputs, totals and the depth profiles as lists (per incident ion)
     rows = []
     for p in core.cached_profiles(min_ions=TRAIN_IONS, cache_dir=core.DATASET_CACHE_DIR):
+        if core.target_too_thin(p):
+            continue   # a first attempt that ions went through; run_sized redid it with a thicker target
         name = target_name(p.material)
         rows.append({
             'target': name, 'target_label': p.material.label, 'ion': p.ion_symbol,

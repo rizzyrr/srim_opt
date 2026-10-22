@@ -158,7 +158,8 @@ def load_runs(min_ions: int = MIN_IONS) -> List[Tuple[str, core.DamageProfile, f
         times = {f[:-4]: os.path.getmtime(os.path.join(cache, f)) for f in os.listdir(cache) if f.endswith('.pkl')}
         for p in core.cached_profiles(min_ions=min_ions, cache_dir=cache):
             name = core.material_name(p.material)
-            if name and not p.meta.get('too_thin'):
+            # too thin: ions went through the back (a first attempt run_sized redid with a thicker target)
+            if name and not p.meta.get('too_thin') and not core.target_too_thin(p):
                 out.append((name, p, times.get(p.meta.get('cache_key', ''), 0.0)))
     return out
 
@@ -429,8 +430,9 @@ def compare(p_true: core.DamageProfile, p_pred: core.DamageProfile) -> dict:
         x = np.linspace(lo, hi, 50)
         k_true = np.interp(x, p_true.depth_nm, p_true.dpa(1.0)).mean()
         k_pred = np.interp(x, p_pred.depth_nm, p_pred.dpa(1.0)).mean()
-        out['fluence_error'] = k_true / k_pred - 1        # fluence ~ 1 / mean dpa per ion in the window
-        out['fluence_1dpa_trim'], out['fluence_1dpa_pred'] = 1 / k_true, 1 / k_pred
+        with np.errstate(divide='ignore'):     # no predicted damage in the window counts as an infinite error
+            out['fluence_error'] = k_true / k_pred - 1    # fluence ~ 1 / mean dpa per ion in the window
+            out['fluence_1dpa_trim'], out['fluence_1dpa_pred'] = 1 / k_true, 1 / k_pred
         out['width_error'] = ((r_pred['roi_width_nm'] if r_pred else 0.0) - r_true['roi_width_nm']) / r_true['roi_width_nm']
     return out
 
@@ -440,19 +442,26 @@ def evaluate_on(model: Surrogate, runs: Sequence[Tuple[str, core.DamageProfile, 
     for name, p, _ in runs:
         pred = model.predict_profiles(p.material, p.ion_symbol, [p.energy_eV])[0]
         rows.append({'target': name, 'ion': p.ion_symbol, 'energy_MeV': p.energy_eV / 1e6,
-                     'number_ions': p.number_ions, 'uncertainty': pred.meta['uncertainty'], **compare(p, pred)})
+                     'number_ions': p.number_ions, 'uncertainty': pred.meta['uncertainty'],
+                     'in_domain': bool(pred.meta['in_domain']), **compare(p, pred)})
     return rows
 
 
 def summarise(rows: List[dict]) -> str:
+    # Percentiles over the runs where TRIM has an ROI window; a prediction with no damage in that window
+    # counts as an infinite error, not as a missing one
     def pct(key, q):
-        v = np.abs([r[key] for r in rows if np.isfinite(r[key])])
+        v = np.abs([r[key] for r in rows if not np.isnan(r[key])])
         return f'{np.percentile(v, q) * 100:5.1f}%' if v.size else '   --'
-    with_window = sum(np.isfinite(r['fluence_error']) for r in rows)
+    with_window = sum(not np.isnan(r['fluence_error']) for r in rows)
+    no_damage = sum(np.isinf(r['fluence_error']) for r in rows)
+    outside = sum(not r.get('in_domain', True) for r in rows)
     return (f'fluence error median {pct("fluence_error", 50)}, p90 {pct("fluence_error", 90)} | '
             f'ROI width error median {pct("width_error", 50)}, p90 {pct("width_error", 90)} | '
             f'damage energy error median {pct("damage_energy_error", 50)} | '
-            f'shape error median {pct("shape_error", 50)} | n = {len(rows)} ({with_window} with a TRIM window)')
+            f'shape error median {pct("shape_error", 50)} | n = {len(rows)} ({with_window} with a TRIM window'
+            + (f', {no_damage} predicted with no damage there' if no_damage else '')
+            + (f'; {outside} flagged out of domain' if outside else '') + ')')
 
 
 def split_pairs(runs, test_fraction: float = 0.15, seed: int = 1):
